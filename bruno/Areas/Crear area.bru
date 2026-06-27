@@ -1,0 +1,25 @@
+meta {
+  name: Crear area
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/areas
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "Tecnología",
+    "areaId": "IT",
+    "description": "Soporte técnico",
+    "managerId": null
+  }
+}

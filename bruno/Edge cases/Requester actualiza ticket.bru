@@ -1,0 +1,31 @@
+meta {
+  name: Requester actualiza ticket (403)
+  type: http
+  seq: 6
+}
+
+put {
+  url: {{baseUrl}}/tickets/{{ticketId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{requesterToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "state": "CLOSED"
+  }
+}
+
+assert {
+  res.status: eq 403
+}
+
+docs {
+  Un REQUESTER no puede actualizar tickets. Usa requesterToken (token de un usuario
+  del grupo Requester).
+}

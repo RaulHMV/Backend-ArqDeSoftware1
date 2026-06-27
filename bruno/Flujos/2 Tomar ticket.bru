@@ -1,0 +1,27 @@
+meta {
+  name: 2 Tomar ticket (a IN_PROGRESS)
+  type: http
+  seq: 2
+}
+
+put {
+  url: {{baseUrl}}/tickets/{{ticketId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "state": "IN_PROGRESS",
+    "reason": "En atencion"
+  }
+}
+
+assert {
+  res.status: eq 200
+}

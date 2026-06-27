@@ -1,0 +1,19 @@
+meta {
+  name: Token invalido (401)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/tickets
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer token.falso.invalido
+}
+
+assert {
+  res.status: eq 401
+}

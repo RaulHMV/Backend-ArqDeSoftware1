@@ -1,0 +1,50 @@
+name: pr-check
+
+# Valida en cada PR: typecheck + build del backend y validacion de Terraform.
+# No toca AWS (no requiere credenciales): usa init -backend=false.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm run build
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+        working-directory: infra
+
+      - name: Validate bootstrap
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+        working-directory: infra/bootstrap
+
+      - name: Validate prod
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+        working-directory: infra/environments/prod

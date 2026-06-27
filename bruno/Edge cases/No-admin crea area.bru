@@ -1,0 +1,26 @@
+meta {
+  name: No-admin crea area (403)
+  type: http
+  seq: 16
+}
+
+post {
+  url: {{baseUrl}}/areas
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{requesterToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "Area pirata"
+  }
+}
+
+assert {
+  res.status: eq 403
+}

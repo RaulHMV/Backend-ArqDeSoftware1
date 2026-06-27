@@ -1,0 +1,27 @@
+meta {
+  name: Requester lista usuarios (403)
+  type: http
+  seq: 14
+}
+
+get {
+  url: {{baseUrl}}/users?areaId={{areaId}}
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{requesterToken}}
+}
+
+params:query {
+  areaId: {{areaId}}
+}
+
+assert {
+  res.status: eq 403
+}
+
+docs {
+  GET /users es solo MANAGER/ADMIN.
+}

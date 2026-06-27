@@ -1,0 +1,28 @@
+meta {
+  name: 6 Comentario con mencion
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/tickets/{{ticketId}}/comments
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "content": "@agente puedes revisar esto porfa",
+    "type": "PUBLIC",
+    "mentions": ["{{agentUserId}}"]
+  }
+}
+
+assert {
+  res.status: eq 201
+}

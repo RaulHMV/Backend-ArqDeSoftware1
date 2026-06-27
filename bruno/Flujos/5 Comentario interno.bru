@@ -1,0 +1,31 @@
+meta {
+  name: 5 Comentario interno (solo staff)
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/tickets/{{ticketId}}/comments
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "content": "Nota interna: revisar contrato de soporte de la impresora",
+    "type": "INTERNAL"
+  }
+}
+
+assert {
+  res.status: eq 201
+}
+
+docs {
+  type INTERNAL es para notas de staff. El frontend debe ocultarlas al requester.
+}

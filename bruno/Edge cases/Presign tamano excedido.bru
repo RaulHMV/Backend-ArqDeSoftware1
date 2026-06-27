@@ -1,0 +1,33 @@
+meta {
+  name: Presign tamano excedido (400)
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{baseUrl}}/attachments/presign
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "ticketId": "{{ticketId}}",
+    "fileName": "enorme.pdf",
+    "mimeType": "application/pdf",
+    "size": 99999999
+  }
+}
+
+assert {
+  res.status: eq 400
+}
+
+docs {
+  Maximo 10 MB (10485760 bytes).
+}

@@ -1,0 +1,21 @@
+meta {
+  name: Listar tickets
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/tickets?limit=25
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+}
+
+params:query {
+  limit: 25
+  ~areaId: {{areaId}}
+  ~state: NEW
+}

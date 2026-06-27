@@ -1,0 +1,19 @@
+meta {
+  name: Ver ticket inexistente (404)
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/tickets/no-existe-12345
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+}
+
+assert {
+  res.status: eq 404
+}

@@ -1,0 +1,31 @@
+meta {
+  name: 4 Cerrar ticket (a CLOSED)
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/tickets/{{ticketId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "state": "CLOSED",
+    "reason": "Confirmado por el usuario"
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Al pasar a CLOSED el backend agrega closedAt automaticamente.
+}

@@ -1,0 +1,15 @@
+meta {
+  name: Listar areas
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/areas
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+}

@@ -1,0 +1,33 @@
+meta {
+  name: 1 Asignar ticket (NEW a ASSIGNED)
+  type: http
+  seq: 1
+}
+
+put {
+  url: {{baseUrl}}/tickets/{{ticketId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "state": "ASSIGNED",
+    "assignedToId": "{{agentUserId}}",
+    "assignedToName": "Agente Uno",
+    "reason": "Asignado a soporte nivel 1"
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Requiere rol AGENT/MANAGER/ADMIN. Escribe un item STATUSCHANGE de NEW->ASSIGNED.
+}

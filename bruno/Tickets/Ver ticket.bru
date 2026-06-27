@@ -1,0 +1,15 @@
+meta {
+  name: Ver ticket
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/tickets/{{ticketId}}
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+}

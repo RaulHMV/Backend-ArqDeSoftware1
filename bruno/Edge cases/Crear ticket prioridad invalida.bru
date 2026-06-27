@@ -1,0 +1,33 @@
+meta {
+  name: Crear ticket prioridad invalida (400)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/tickets
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "title": "Prioridad mala",
+    "description": "URGENTISIMO no es un valor valido",
+    "areaId": "{{areaId}}",
+    "priority": "URGENTISIMO"
+  }
+}
+
+assert {
+  res.status: eq 400
+}
+
+docs {
+  priority valida solo: LOW, MEDIUM, HIGH, CRITICAL.
+}

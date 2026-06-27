@@ -1,0 +1,26 @@
+meta {
+  name: Crear/editar usuario
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/users
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "userId": "<sub de Cognito>",
+    "email": "agente@empresa.com",
+    "role": "AGENT",
+    "fullName": "Agente Uno",
+    "areaId": "{{areaId}}"
+  }
+}

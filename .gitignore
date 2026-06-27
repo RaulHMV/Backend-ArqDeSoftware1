@@ -1,0 +1,22 @@
+# Node
+node_modules/
+backend/dist/
+*.log
+.env
+.env.*
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+.terraform.lock.hcl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/

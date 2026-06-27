@@ -1,0 +1,24 @@
+meta {
+  name: Descargar adjunto inexistente (404)
+  type: http
+  seq: 13
+}
+
+get {
+  url: {{baseUrl}}/attachments/download?ticketId={{ticketId}}&attachmentId=no-existe
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+}
+
+params:query {
+  ticketId: {{ticketId}}
+  attachmentId: no-existe
+}
+
+assert {
+  res.status: eq 404
+}

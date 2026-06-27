@@ -1,0 +1,19 @@
+meta {
+  name: Sin token (401)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/tickets
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 401
+}
+
+docs {
+  Sin header Authorization la HTTP API responde 401 (authorizer JWT).
+}

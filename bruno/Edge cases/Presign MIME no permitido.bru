@@ -1,0 +1,32 @@
+meta {
+  name: Presign MIME no permitido (400)
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{baseUrl}}/attachments/presign
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "ticketId": "{{ticketId}}",
+    "fileName": "virus.exe",
+    "mimeType": "application/x-msdownload"
+  }
+}
+
+assert {
+  res.status: eq 400
+}
+
+docs {
+  MIME permitidos: png, jpeg, gif, webp, pdf, txt, doc, docx, xls, xlsx.
+}

@@ -1,0 +1,43 @@
+meta {
+  name: Crear ticket
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/tickets
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "title": "No imprime la impresora",
+    "description": "La impresora del piso 3 no responde",
+    "areaId": "{{areaId}}",
+    "category": "HARDWARE",
+    "priority": "HIGH"
+  }
+}
+
+assert {
+  res.status: eq 201
+}
+
+script:post-response {
+  if (res.getStatus() === 201) {
+    const b = res.getBody();
+    bru.setEnvVar("ticketId", b.ticketId);
+    bru.setEnvVar("ticketNumber", b.number);
+  }
+}
+
+docs {
+  Crea un ticket. Estado inicial siempre NEW. Guarda automaticamente ticketId y
+  ticketNumber en el environment para encadenar las demas requests.
+}

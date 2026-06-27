@@ -1,0 +1,20 @@
+meta {
+  name: Presign descargar
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/attachments/download?ticketId={{ticketId}}&attachmentId={{attachmentId}}
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+}
+
+params:query {
+  ticketId: {{ticketId}}
+  attachmentId: {{attachmentId}}
+}

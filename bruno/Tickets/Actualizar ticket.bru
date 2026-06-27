@@ -1,0 +1,26 @@
+meta {
+  name: Actualizar ticket
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/tickets/{{ticketId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "state": "IN_PROGRESS",
+    "assignedToId": "",
+    "assignedToName": "",
+    "resolutionNotes": "",
+    "reason": "Tomado por soporte"
+  }
+}

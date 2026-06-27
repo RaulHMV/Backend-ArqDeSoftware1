@@ -1,0 +1,76 @@
+meta {
+  name: Conectar WebSocket
+  type: ws
+  seq: 1
+}
+
+ws {
+  url: {{wsUrl}}?token={{idToken}}
+}
+
+headers {
+  ~Authorization: 
+}
+
+docs {
+  # WebSocket en tiempo real
+
+  ## Conexion
+  El token va SIEMPRE en el query string (la API no lee headers en el handshake):
+
+      wss://frr4uakqw2.execute-api.us-east-1.amazonaws.com/prod?token=<ID_TOKEN>
+
+  En esta request la URL ya arma `{{wsUrl}}?token={{idToken}}` con tu environment.
+  El authorizer valida el ID token de Cognito (tokenUse=id). Sin token o invalido = se
+  rechaza la conexion (Deny).
+
+  ## Heartbeat (mantener viva la conexion)
+  Cada conexion expira por TTL a las 2 horas. Para renovarla manda este mensaje en la
+  ruta `sendMessage`:
+
+      {"action":"sendMessage"}
+
+  El server renueva el TTL y responde:
+
+      {"type":"pong","ts":1750000000}
+
+  Recomendado: mandarlo cada ~5-10 min desde el front.
+
+  ## Eventos push (te llegan solos, no los pides)
+  Cuando algo cambia en DynamoDB, el backend empuja por el socket:
+
+  ### Ticket creado o actualizado -> a todas las conexiones del AREA del ticket
+      {
+        "type": "TICKET",
+        "event": "INSERT" | "MODIFY",
+        "ticketId": "...",
+        "number": "TKT-2026-0001",
+        "title": "...",
+        "state": "NEW|ASSIGNED|IN_PROGRESS|RESOLVED|CLOSED",
+        "priority": "LOW|MEDIUM|HIGH|CRITICAL",
+        "areaId": "IT"
+      }
+
+  ### Comentario nuevo -> al requester + asignado + area del ticket (deduplicado)
+      {
+        "type": "COMMENT",
+        "event": "INSERT" | "MODIFY",
+        "ticketId": "...",
+        "commentId": "...",
+        "authorName": "...",
+        "preview": "primeros 140 caracteres del comentario"
+      }
+
+  ## Como probar
+  - Bruno: abre esta request y dale Connect. Luego en el panel de mensajes manda
+    {"action":"sendMessage"} y deberias ver el pong. Deja la conexion abierta y crea
+    un ticket (REST) en esa misma area para ver llegar el evento TICKET.
+  - Por terminal con websocat:
+        websocat "wss://frr4uakqw2.execute-api.us-east-1.amazonaws.com/prod?token=<ID_TOKEN>"
+    y escribe {"action":"sendMessage"} para el heartbeat.
+
+  ## Notas
+  - Si la conexion se cae (410 Gone), el backend la borra sola de la tabla.
+  - El area de la conexion sale del custom:areaId del token; por eso solo recibes
+    eventos de TU area (los de comentario tambien si eres requester o asignado).
+}

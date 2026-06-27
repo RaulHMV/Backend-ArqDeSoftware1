@@ -1,0 +1,40 @@
+meta {
+  name: Presign subir
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/attachments/presign
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "ticketId": "{{ticketId}}",
+    "fileName": "captura.png",
+    "mimeType": "image/png",
+    "size": 12345
+  }
+}
+
+assert {
+  res.status: eq 201
+}
+
+script:post-response {
+  if (res.getStatus() === 201) {
+    bru.setEnvVar("attachmentId", res.getBody().attachmentId);
+  }
+}
+
+docs {
+  La respuesta trae uploadUrl. Luego haz PUT a esa URL con el binario del archivo
+  y header Content-Type igual al mimeType. Guarda attachmentId en el environment.
+}

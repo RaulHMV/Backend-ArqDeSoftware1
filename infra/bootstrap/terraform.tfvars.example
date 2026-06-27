@@ -1,0 +1,4 @@
+# El bootstrap funciona con los valores por defecto (region us-east-1,
+# project ticketsys). Solo crea este terraform.tfvars si quieres cambiarlos.
+# region  = "us-east-1"
+# project = "ticketsys"

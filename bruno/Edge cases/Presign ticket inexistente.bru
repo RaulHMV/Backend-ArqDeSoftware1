@@ -1,0 +1,28 @@
+meta {
+  name: Presign ticket inexistente (404)
+  type: http
+  seq: 12
+}
+
+post {
+  url: {{baseUrl}}/attachments/presign
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{idToken}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "ticketId": "no-existe-12345",
+    "fileName": "doc.pdf",
+    "mimeType": "application/pdf"
+  }
+}
+
+assert {
+  res.status: eq 404
+}
