@@ -188,6 +188,7 @@ locals {
     "PUT /tickets/{id}"           = { uri = module.lambdas["tickets"].invoke_arn, fn = module.lambdas["tickets"].function_name }
     "GET /tickets/{id}/comments"  = { uri = module.lambdas["comments"].invoke_arn, fn = module.lambdas["comments"].function_name }
     "POST /tickets/{id}/comments" = { uri = module.lambdas["comments"].invoke_arn, fn = module.lambdas["comments"].function_name }
+    "GET /tickets/{id}/attachments" = { uri = module.lambdas["attachments"].invoke_arn, fn = module.lambdas["attachments"].function_name }
     "POST /attachments/presign"   = { uri = module.lambdas["attachments"].invoke_arn, fn = module.lambdas["attachments"].function_name }
     "GET /attachments/download"   = { uri = module.lambdas["attachments"].invoke_arn, fn = module.lambdas["attachments"].function_name }
     "GET /users/me"               = { uri = module.lambdas["users"].invoke_arn, fn = module.lambdas["users"].function_name }
