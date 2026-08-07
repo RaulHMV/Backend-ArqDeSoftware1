@@ -20,11 +20,11 @@ await Promise.all(
       platform: "node",
       target: "node20",
       format: "cjs",
-      minify: false,
+      minify: true,
       sourcemap: false,
-      // El runtime de Lambda nodejs20 trae el AWS SDK v3, pero lo bundleamos
-      // para fijar versiones y evitar sorpresas.
-      external: [],
+      // El runtime nodejs20.x ya incluye @aws-sdk v3: marcarlo externo evita
+      // bundlear ~3 MB por handler y reduce cold-start.
+      external: ["@aws-sdk/*"],
     }).then(() => console.log(`built ${name}`))
   )
 );
