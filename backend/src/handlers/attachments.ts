@@ -35,6 +35,9 @@ export const handler = async (
     if (event.routeKey === "GET /attachments/download") {
       return await presignDownload(event);
     }
+    if (event.routeKey === "GET /tickets/{id}/attachments") {
+      return await listAttachments(event);
+    }
     return notFound("Route not handled");
   } catch (err) {
     console.error("attachments handler error", err);
@@ -136,4 +139,24 @@ async function presignDownload(
 
   const downloadUrl = await presignGet(res.Item.s3Key as string);
   return ok({ downloadUrl, fileName: res.Item.fileName, expiresIn: 300 });
+}
+
+async function listAttachments(
+  event: APIGatewayProxyEventV2WithJWTAuthorizer
+) {
+  const ticketId = event.pathParameters?.id;
+  if (!ticketId) return badRequest("ticketId requerido");
+
+  const res = await ddb.send(
+    new QueryCommand({
+      TableName: MAIN_TABLE,
+      KeyConditionExpression: "PK = :pk AND begins_with(SK, :sk)",
+      ExpressionAttributeValues: {
+        ":pk": `TICKET#${ticketId}`,
+        ":sk": "ATTACHMENT#",
+      },
+      ScanIndexForward: true,
+    })
+  );
+  return ok({ items: res.Items ?? [] });
 }
