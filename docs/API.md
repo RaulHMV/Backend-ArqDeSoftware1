@@ -51,6 +51,7 @@ Todos requieren el header `Authorization`. La columna **Rol** indica quién pued
 | POST | `/tickets/{id}/comments` | cualquiera | Agregar comentario |
 | POST | `/attachments/presign` | cualquiera | URL prefirmada para subir archivo |
 | GET | `/attachments/download` | cualquiera | URL prefirmada para descargar |
+| GET | `/tickets/{id}/attachments` | cualquiera | Listar adjuntos de un ticket |
 | GET | `/users/me` | cualquiera | Mi perfil |
 | GET | `/users` | Manager/Admin | Usuarios de un área |
 | POST | `/users` | Admin | Alta/edición de usuario |
@@ -129,6 +130,10 @@ Body:
 ### GET /attachments/download
 Query: `?ticketId=<id>&attachmentId=<id>`.
 - Respuesta: `{ "downloadUrl", "fileName", "expiresIn": 300 }`.
+
+### GET /tickets/{id}/attachments
+- Respuesta: `{ "items": [ { attachmentId, fileName, mimeType, size, uploadedBy, uploadedByName, uploadedAt, parentType, commentId } ] }`.
+- Devuelve todos los adjuntos del ticket (tanto del ticket como de sus comentarios).
 
 ### GET /users/me
 - Respuesta: el perfil del usuario autenticado.
