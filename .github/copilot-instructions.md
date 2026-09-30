@@ -16,7 +16,8 @@ desplegado con Terraform desde GitHub Actions. **Responde en español casual.**
 ticket-system/
   backend/    Node 20 + TS (ESM), bundle esbuild → dist/<handler>/index.js
   infra/      Terraform: bootstrap, modules, environments/prod (ÚNICO env)
-  .github/    workflows (bootstrap, pr-check, deploy) + instructions
+  .github/    workflows (bootstrap, pr-check, deploy, pg-deploy, pg-destroy) + instructions
+  infra/ansible + infra/environments/pg-multimaster: Postgres maestro-maestro en 2 EC2 (aparte)
 ```
 
 ## Datos AWS

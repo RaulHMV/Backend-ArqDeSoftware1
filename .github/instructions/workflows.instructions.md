@@ -22,6 +22,11 @@ Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Variable: `AWS_REGION`.
   Compila Lambdas (`npm install` + `npm run build`) y corre Terraform en
   `infra/environments/prod` (init + plan, y apply solo si action=apply).
 
+- `pg-deploy.yml` / `pg-destroy.yml`: MANUALES, stack `pg-multimaster` (2 EC2 + Ansible).
+  Mismas llaves estáticas + secret extra `POSTGRES_PASSWORD`. deploy: `plan` o `apply`
+  (confirm `deploy`; aplica el plan guardado). destroy: confirm `destroy`.
+  Comparten `concurrency: pg-multimaster`. `pr-check` también valida este stack.
+
 ## Reglas
 - Mantener deploy MANUAL; no agregar trigger `push`/auto salvo petición.
 - No reintroducir OIDC ni `role-to-assume`; usar `aws-access-key-id`/`aws-secret-access-key`.

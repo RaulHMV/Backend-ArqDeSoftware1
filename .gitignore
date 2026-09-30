@@ -20,3 +20,7 @@ override.tf.json
 .DS_Store
 Thumbs.db
 .idea/
+
+# Python
+__pycache__/
+*.pyc

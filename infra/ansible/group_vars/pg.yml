@@ -1,0 +1,14 @@
+---
+db_name: demo
+pg_conf_dir: /etc/postgresql/16/main
+
+# "El otro" nodo: el unico host del grupo que no soy yo.
+peer: "{{ (groups['pg'] | difference([inventory_hostname])) | first }}"
+peer_ip: "{{ hostvars[peer].private_ip }}"
+
+# Tu llave publica para entrar por SSH a mano (variable SSH_PUBLIC_KEY de GitHub).
+# Opcional: si esta vacia solo entra la llave que genera Terraform (la del runner).
+extra_ssh_key: "{{ lookup('env', 'SSH_PUBLIC_KEY') }}"
+
+# Viene del secret POSTGRES_PASSWORD de GitHub (nunca va en el repo).
+db_password: "{{ lookup('env', 'POSTGRES_PASSWORD') }}"

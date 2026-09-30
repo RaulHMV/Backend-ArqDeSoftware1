@@ -1,0 +1,175 @@
+name: pg-deploy
+
+# Levanta 2 EC2 con PostgreSQL 16 en replicacion logica maestro-maestro:
+# Terraform crea las maquinas y Ansible configura Postgres en cada una.
+# Stack independiente del backend serverless (state propio: pg-multimaster/).
+#
+# Despliegue MANUAL. En GitHub > Actions > pg-deploy > Run workflow:
+#   - action: plan (solo previsualiza) o apply (crea y configura de verdad).
+#   - confirm: para apply, escribe "deploy".
+#
+# Requisitos (Settings > Secrets and variables > Actions, scope repo):
+#   - secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  (ya existen)
+#   - secret NUEVO: POSTGRES_PASSWORD (min 12 chars, solo letras, numeros, _ . -)
+#   - variable: AWS_REGION  (ya existe)
+#   - variable NUEVA (opcional, recomendada): SSH_PUBLIC_KEY = contenido de tu
+#     ~/.ssh/id_ed25519.pub. Con ella entras por SSH a los nodos. Es publica, va en
+#     Variables (no en Secrets).
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Que hacer"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+      confirm:
+        description: 'Para "apply" escribe: deploy'
+        required: false
+        default: ""
+        type: string
+      show_ssh_key:
+        description: "Mostrar la llave SSH privada en el resumen del run (solo repo PRIVADO)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Un solo run a la vez sobre este state (deploy y destroy comparten grupo).
+concurrency:
+  group: pg-multimaster
+  cancel-in-progress: false
+
+env:
+  TF_DIR: infra/environments/pg-multimaster
+  ANSIBLE_DIR: infra/ansible
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar confirmacion (solo apply)
+        if: ${{ inputs.action == 'apply' && inputs.confirm != 'deploy' }}
+        run: |
+          echo "::error::Para 'apply' debes escribir 'deploy' en el campo confirm."
+          exit 1
+
+      # La llave privada en el resumen la ve cualquiera con acceso de lectura al repo:
+      # si es publico, cualquiera podria entrar a las EC2. Falla ANTES de crear nada.
+      - name: Validar repo privado (solo si piden mostrar la llave)
+        if: ${{ inputs.action == 'apply' && inputs.show_ssh_key }}
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [[ "$REPO_PRIVATE" != "true" ]]; then
+            echo "::error::El repo es publico: no se muestra la llave privada. Usa SSH_PUBLIC_KEY o vuelve el repo privado."
+            exit 1
+          fi
+
+      # Falla rapido y claro antes de crear nada en AWS.
+      # Sin comillas/espacios: el password va dentro del CONNECTION de la suscripcion.
+      - name: Validar POSTGRES_PASSWORD (solo apply)
+        if: ${{ inputs.action == 'apply' }}
+        env:
+          PG_PASS: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          if [[ ! "$PG_PASS" =~ ^[A-Za-z0-9_.-]{12,}$ ]]; then
+            echo "::error::POSTGRES_PASSWORD debe existir, tener >=12 caracteres y solo [A-Za-z0-9_.-]."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          # Sin wrapper: necesitamos la salida limpia de `terraform output`.
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -input=false -out=tfplan
+
+      # Aplica exactamente el plan de arriba (no recalcula).
+      - name: Terraform Apply
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false tfplan
+
+      - name: Generar llave SSH e inventario
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          KEY="$RUNNER_TEMP/pg_key"
+          terraform -chdir="$TF_DIR" output -raw ssh_private_key > "$KEY"
+          chmod 600 "$KEY"
+          terraform -chdir="$TF_DIR" output -json nodes > "$RUNNER_TEMP/nodes.json"
+          python3 "$ANSIBLE_DIR/make_inventory.py" "$RUNNER_TEMP/nodes.json" "$KEY" > "$RUNNER_TEMP/inventory.json"
+
+      - name: Instalar Ansible
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          pipx install "ansible-core==2.17.*"
+          ansible-galaxy collection install community.postgresql
+
+      - name: Configurar PostgreSQL (Ansible)
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: ${{ env.ANSIBLE_DIR }}
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+        run: ansible-playbook -i "$RUNNER_TEMP/inventory.json" playbook.yml
+
+      - name: Resumen
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          {
+            echo "### Nodos PostgreSQL maestro-maestro"
+            echo
+            echo "| Nodo | AZ | IP publica | IP privada |"
+            echo "|---|---|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.az) | \(.value.public_ip) | \(.value.private_ip) |"' "$RUNNER_TEMP/nodes.json"
+            echo
+            echo "SSH: \`ssh ubuntu@<IP publica>\` (con la llave de tu variable SSH_PUBLIC_KEY)."
+            echo "Recuerda correr **pg-destroy** cuando termines: las EC2 siguen facturando."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Opcional (input show_ssh_key, solo repo privado): bloque para copiar y pegar.
+      - name: Mostrar llave SSH en el resumen
+        if: ${{ inputs.action == 'apply' && inputs.show_ssh_key }}
+        run: |
+          {
+            echo "### Llave SSH (copia TODO el bloque y pegalo en tu terminal)"
+            echo
+            echo '```bash'
+            echo "cat > ~/pg_key <<'EOF'"
+            cat "$RUNNER_TEMP/pg_key"
+            echo "EOF"
+            echo "chmod 600 ~/pg_key"
+            echo '```'
+            echo
+            echo "Despues conectate (usuario \`ubuntu\`, sin password: AWS solo acepta llave):"
+            echo
+            jq -r 'to_entries[] | "- \(.key): `ssh -i ~/pg_key ubuntu@\(.value.public_ip)`"' "$RUNNER_TEMP/nodes.json"
+            echo
+            echo "Ya dentro: \`sudo -u postgres psql demo\` (no pide password; el password es el secret POSTGRES_PASSWORD, solo para conexiones por red)."
+            echo
+            echo "> Esta llave es de una demo: corre **pg-destroy** al terminar."
+          } >> "$GITHUB_STEP_SUMMARY"

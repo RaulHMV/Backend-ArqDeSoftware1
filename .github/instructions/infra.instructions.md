@@ -18,6 +18,13 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
 - bucket `ticketsys-tfstate-020379956700`, key `prod/terraform.tfstate`,
   region us-east-1, lock table `ticketsys-tf-locks`, encrypt=true.
 
+- `environments/pg-multimaster/`: stack APARTE (no toca el serverless). 2 EC2 t3.micro en
+  2 AZs, SG con reglas como recursos separados (nada inline), llave ED25519 vía
+  `tls_private_key`. State: mismo bucket/lock, key `pg-multimaster/terraform.tfstate`.
+  `ami` va en `ignore_changes` a propósito (evita reemplazar los nodos y perder datos).
+- `ansible/`: playbook Postgres 16 maestro-maestro (replicación lógica, `origin = none`).
+  El inventario se genera en el workflow con `make_inventory.py` desde `terraform output`.
+
 ## Stack (modules/stack) — puntos clave
 - DynamoDB main (PK/SK, 4 GSIs, Streams NEW_AND_OLD_IMAGES, PITR en prod) + WSConnections.
 - Cognito (email username, `custom:areaId`, grupos Requester/Agent/Manager/Admin,

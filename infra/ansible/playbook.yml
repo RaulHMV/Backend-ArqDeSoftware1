@@ -1,0 +1,182 @@
+---
+# PostgreSQL 16 maestro-maestro (replicacion logica bidireccional) en 2 nodos.
+# Secret requerido en el entorno: POSTGRES_PASSWORD (lo inyecta el workflow).
+#
+# Play 1: instala y configura Postgres, crea DB/tabla/publicacion en cada nodo.
+# Play 2: cada nodo se suscribe a la publicacion del otro (origin = none evita
+#         que un cambio rebote A -> B -> A). Va separado para que las dos
+#         publicaciones existan antes de crear las suscripciones.
+
+- name: Preparar nodos y publicaciones
+  hosts: pg
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Esperar SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    # cloud-init todavia puede tener el lock de dpkg en el primer boot
+    - name: Esperar a que cloud-init termine
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      failed_when: cloud_init.rc not in [0, 2]
+
+  tasks:
+    - name: Validar que llego el password
+      ansible.builtin.assert:
+        that: db_password | length > 0
+        fail_msg: "Falta POSTGRES_PASSWORD en el entorno"
+      no_log: true
+
+    - name: Validar formato de SSH_PUBLIC_KEY (si se dio)
+      ansible.builtin.assert:
+        that: extra_ssh_key is match('^ssh-(ed25519|rsa) ')
+        fail_msg: "SSH_PUBLIC_KEY debe ser una llave publica (ssh-ed25519 ... o ssh-rsa ...)"
+      when: extra_ssh_key | length > 0
+
+    - name: Autorizar tu llave SSH para el usuario ubuntu
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        line: "{{ extra_ssh_key }}"
+      when: extra_ssh_key | length > 0
+
+    - name: Instalar PostgreSQL 16 y dependencias
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - python3-psycopg2
+          - acl
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Configuracion de replicacion logica
+      ansible.builtin.copy:
+        dest: "{{ pg_conf_dir }}/conf.d/multimaster.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+        content: |
+          wal_level = logical
+          listen_addresses = '*'
+      notify: Restart postgresql
+
+    - name: Permitir solo al nodo par (IP privada) para replicar
+      ansible.builtin.blockinfile:
+        path: "{{ pg_conf_dir }}/pg_hba.conf"
+        marker: "# {mark} ANSIBLE multimaster"
+        block: |
+          host {{ db_name }} replicator {{ peer_ip }}/32 scram-sha-256
+      notify: Restart postgresql
+
+    # wal_level y listen_addresses solo toman efecto con restart
+    - name: Aplicar cambios ahora
+      ansible.builtin.meta: flush_handlers
+
+    - name: Postgres arriba y habilitado
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Password del usuario postgres
+      community.postgresql.postgresql_user:
+        name: postgres
+        password: "{{ db_password }}"
+      become_user: postgres
+      no_log: true
+
+    - name: Usuario de replicacion
+      community.postgresql.postgresql_user:
+        name: replicator
+        password: "{{ db_password }}"
+        role_attr_flags: LOGIN,REPLICATION
+      become_user: postgres
+      no_log: true
+
+    - name: Base de datos {{ db_name }}
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+      become_user: postgres
+
+    # Secuencia por nodo: node_a genera impares (1,3,5..), node_b pares (2,4,6..)
+    # y se engancha como DEFAULT de id, asi los IDs nunca chocan entre nodos.
+    - name: Tabla mensajes con secuencia por nodo
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          CREATE SEQUENCE IF NOT EXISTS mensajes_id_seq START {{ node_index | int + 1 }} INCREMENT 2;
+          CREATE TABLE IF NOT EXISTS mensajes (
+            id bigint PRIMARY KEY DEFAULT nextval('mensajes_id_seq'),
+            nodo text NOT NULL DEFAULT '{{ inventory_hostname }}',
+            contenido text NOT NULL,
+            creado_en timestamptz NOT NULL DEFAULT now()
+          );
+          ALTER TABLE mensajes ALTER COLUMN id SET DEFAULT nextval('mensajes_id_seq');
+          ALTER SEQUENCE mensajes_id_seq OWNED BY mensajes.id;
+          GRANT SELECT ON mensajes TO replicator;
+      become_user: postgres
+
+    - name: Publicacion de este nodo
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'pub_{{ inventory_hostname }}') THEN
+              CREATE PUBLICATION pub_{{ inventory_hostname }} FOR TABLE mensajes;
+            END IF;
+          END
+          $$;
+      become_user: postgres
+
+  handlers:
+    - name: Restart postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+- name: Suscripciones cruzadas
+  hosts: pg
+  become: true
+  gather_facts: false
+  vars:
+    sub_name:"sub_{{ inventory_hostname }}_from_{{ peer }}"
+
+  tasks:
+    - name: Ver si la suscripcion ya existe
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: "SELECT 1 FROM pg_subscription WHERE subname = '{{ sub_name }}'"
+      become_user: postgres
+      register: sub_exists
+      changed_when: false
+
+    # CREATE SUBSCRIPTION no puede correr dentro de una transaccion -> autocommit.
+    # copy_data = false: las tablas nacen vacias en ambos nodos.
+    - name: Crear suscripcion a la publicacion del otro nodo
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        autocommit: true
+        query: >-
+          CREATE SUBSCRIPTION {{ sub_name }}
+          CONNECTION 'host={{ peer_ip }} port=5432 dbname={{ db_name }} user=replicator password={{ db_password }}'
+          PUBLICATION pub_{{ peer }}
+          WITH (origin = none, copy_data = false)
+      become_user: postgres
+      when: sub_exists.rowcount == 0
+      no_log: true
+
+    - name: Verificar que el worker de replicacion esta corriendo
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: "SELECT count(*) AS n FROM pg_stat_subscription WHERE subname = '{{ sub_name }}' AND pid IS NOT NULL"
+      become_user: postgres
+      register: sub_status
+      until: sub_status.query_result[0].n | int == 1
+      retries: 15
+      delay: 4
+      changed_when: false
