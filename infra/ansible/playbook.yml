@@ -31,6 +31,18 @@
         fail_msg: "Falta POSTGRES_PASSWORD en el entorno"
       no_log: true
 
+    - name: Validar formato de SSH_PUBLIC_KEY (si se dio)
+      ansible.builtin.assert:
+        that: extra_ssh_key is match('^ssh-(ed25519|rsa) ')
+        fail_msg: "SSH_PUBLIC_KEY debe ser una llave publica (ssh-ed25519 ... o ssh-rsa ...)"
+      when: extra_ssh_key | length > 0
+
+    - name: Autorizar tu llave SSH para el usuario ubuntu
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        line: "{{ extra_ssh_key }}"
+      when: extra_ssh_key | length > 0
+
     - name: Instalar PostgreSQL 16 y dependencias
       ansible.builtin.apt:
         name:

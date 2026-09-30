@@ -12,6 +12,9 @@ name: pg-deploy
 #   - secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  (ya existen)
 #   - secret NUEVO: POSTGRES_PASSWORD (min 12 chars, solo letras, numeros, _ . -)
 #   - variable: AWS_REGION  (ya existe)
+#   - variable NUEVA (opcional, recomendada): SSH_PUBLIC_KEY = contenido de tu
+#     ~/.ssh/id_ed25519.pub. Con ella entras por SSH a los nodos. Es publica, va en
+#     Variables (no en Secrets).
 
 on:
   workflow_dispatch:
@@ -29,6 +32,11 @@ on:
         required: false
         default: ""
         type: string
+      show_ssh_key:
+        description: "Mostrar la llave SSH privada en el resumen del run (solo repo PRIVADO)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -52,6 +60,18 @@ jobs:
         run: |
           echo "::error::Para 'apply' debes escribir 'deploy' en el campo confirm."
           exit 1
+
+      # La llave privada en el resumen la ve cualquiera con acceso de lectura al repo:
+      # si es publico, cualquiera podria entrar a las EC2. Falla ANTES de crear nada.
+      - name: Validar repo privado (solo si piden mostrar la llave)
+        if: ${{ inputs.action == 'apply' && inputs.show_ssh_key }}
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [[ "$REPO_PRIVATE" != "true" ]]; then
+            echo "::error::El repo es publico: no se muestra la llave privada. Usa SSH_PUBLIC_KEY o vuelve el repo privado."
+            exit 1
+          fi
 
       # Falla rapido y claro antes de crear nada en AWS.
       # Sin comillas/espacios: el password va dentro del CONNECTION de la suscripcion.
@@ -114,6 +134,7 @@ jobs:
         working-directory: ${{ env.ANSIBLE_DIR }}
         env:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
         run: ansible-playbook -i "$RUNNER_TEMP/inventory.json" playbook.yml
 
       - name: Resumen
@@ -126,6 +147,29 @@ jobs:
             echo "|---|---|---|---|"
             jq -r 'to_entries[] | "| \(.key) | \(.value.az) | \(.value.public_ip) | \(.value.private_ip) |"' "$RUNNER_TEMP/nodes.json"
             echo
-            echo "SSH: usuario \`ubuntu\`, llave = output \`ssh_private_key\` del state."
+            echo "SSH: \`ssh ubuntu@<IP publica>\` (con la llave de tu variable SSH_PUBLIC_KEY)."
             echo "Recuerda correr **pg-destroy** cuando termines: las EC2 siguen facturando."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Opcional (input show_ssh_key, solo repo privado): bloque para copiar y pegar.
+      - name: Mostrar llave SSH en el resumen
+        if: ${{ inputs.action == 'apply' && inputs.show_ssh_key }}
+        run: |
+          {
+            echo "### Llave SSH (copia TODO el bloque y pegalo en tu terminal)"
+            echo
+            echo '```bash'
+            echo "cat > ~/pg_key <<'EOF'"
+            cat "$RUNNER_TEMP/pg_key"
+            echo "EOF"
+            echo "chmod 600 ~/pg_key"
+            echo '```'
+            echo
+            echo "Despues conectate (usuario \`ubuntu\`, sin password: AWS solo acepta llave):"
+            echo
+            jq -r 'to_entries[] | "- \(.key): `ssh -i ~/pg_key ubuntu@\(.value.public_ip)`"' "$RUNNER_TEMP/nodes.json"
+            echo
+            echo "Ya dentro: \`sudo -u postgres psql demo\` (no pide password; el password es el secret POSTGRES_PASSWORD, solo para conexiones por red)."
+            echo
+            echo "> Esta llave es de una demo: corre **pg-destroy** al terminar."
           } >> "$GITHUB_STEP_SUMMARY"
