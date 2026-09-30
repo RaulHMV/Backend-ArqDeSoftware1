@@ -26,6 +26,9 @@ Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Variable: `AWS_REGION`.
   Mismas llaves estáticas + secret extra `POSTGRES_PASSWORD`. deploy: `plan` o `apply`
   (confirm `deploy`; aplica el plan guardado). destroy: confirm `destroy`.
   Comparten `concurrency: pg-multimaster`. `pr-check` también valida este stack.
+  Ansible va FIJO en un venv propio (Python 3.12, ansible-core 2.21.4,
+  community.postgresql 5.0.0): NO usar el Ansible/colecciones preinstalados del runner.
+  Si subes versiones, prueba antes: en c.postgresql 5 `db` ya es `login_db`.
 
 ## Reglas
 - Mantener deploy MANUAL; no agregar trigger `push`/auto salvo petición.

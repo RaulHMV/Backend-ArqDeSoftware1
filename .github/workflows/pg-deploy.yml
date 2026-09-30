@@ -123,11 +123,22 @@ jobs:
           terraform -chdir="$TF_DIR" output -json nodes > "$RUNNER_TEMP/nodes.json"
           python3 "$ANSIBLE_DIR/make_inventory.py" "$RUNNER_TEMP/nodes.json" "$KEY" > "$RUNNER_TEMP/inventory.json"
 
+      - uses: actions/setup-python@v5
+        if: ${{ inputs.action == 'apply' }}
+        with:
+          python-version: "3.12"
+
+      # Versiones FIJAS (las probadas). El runner trae su propio Ansible y
+      # colecciones preinstaladas que cambian solas entre imagenes: no se usan.
       - name: Instalar Ansible
         if: ${{ inputs.action == 'apply' }}
         run: |
-          pipx install "ansible-core==2.17.*"
-          ansible-galaxy collection install community.postgresql
+          python -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/pip" install --quiet "ansible-core==2.21.4"
+          "$RUNNER_TEMP/ansible-venv/bin/ansible-galaxy" collection install \
+            "community.postgresql:==5.0.0" -p "$RUNNER_TEMP/collections"
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/collections" >> "$GITHUB_ENV"
 
       - name: Configurar PostgreSQL (Ansible)
         if: ${{ inputs.action == 'apply' }}

@@ -1,6 +1,7 @@
 ---
 db_name: demo
 pg_conf_dir: /etc/postgresql/16/main
+pg_socket_dir: /var/run/postgresql
 
 # "El otro" nodo: el unico host del grupo que no soy yo.
 peer: "{{ (groups['pg'] | difference([inventory_hostname])) | first }}"

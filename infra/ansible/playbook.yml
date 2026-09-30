@@ -6,11 +6,17 @@
 # Play 2: cada nodo se suscribe a la publicacion del otro (origin = none evita
 #         que un cambio rebote A -> B -> A). Va separado para que las dos
 #         publicaciones existan antes de crear las suscripciones.
+#
+# Tags: "os" = sistema operativo (apt, archivos de config, servicio);
+#       "db" = todo lo que se hace dentro de Postgres.
 
 - name: Preparar nodos y publicaciones
   hosts: pg
   become: true
   gather_facts: false
+  module_defaults:
+    group/community.postgresql.all:
+      login_unix_socket: "{{ pg_socket_dir }}"
 
   pre_tasks:
     - name: Esperar SSH
@@ -23,6 +29,7 @@
       register: cloud_init
       changed_when: false
       failed_when: cloud_init.rc not in [0, 2]
+      tags: os
 
   tasks:
     - name: Validar que llego el password
@@ -30,19 +37,24 @@
         that: db_password | length > 0
         fail_msg: "Falta POSTGRES_PASSWORD en el entorno"
       no_log: true
+      tags: db
 
     - name: Validar formato de SSH_PUBLIC_KEY (si se dio)
       ansible.builtin.assert:
         that: extra_ssh_key is match('^ssh-(ed25519|rsa) ')
         fail_msg: "SSH_PUBLIC_KEY debe ser una llave publica (ssh-ed25519 ... o ssh-rsa ...)"
       when: extra_ssh_key | length > 0
+      tags: os
 
     - name: Autorizar tu llave SSH para el usuario ubuntu
       ansible.builtin.lineinfile:
         path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
         line: "{{ extra_ssh_key }}"
       when: extra_ssh_key | length > 0
+      tags: os
 
+    # lock_timeout alto: en el primer boot unattended-upgrades puede tener
+    # el lock de dpkg varios minutos (el default de 60 s no alcanza).
     - name: Instalar PostgreSQL 16 y dependencias
       ansible.builtin.apt:
         name:
@@ -52,6 +64,8 @@
         state: present
         update_cache: true
         cache_valid_time: 3600
+        lock_timeout: 600
+      tags: os
 
     - name: Configuracion de replicacion logica
       ansible.builtin.copy:
@@ -63,6 +77,7 @@
           wal_level = logical
           listen_addresses = '*'
       notify: Restart postgresql
+      tags: os
 
     - name: Permitir solo al nodo par (IP privada) para replicar
       ansible.builtin.blockinfile:
@@ -71,16 +86,19 @@
         block: |
           host {{ db_name }} replicator {{ peer_ip }}/32 scram-sha-256
       notify: Restart postgresql
+      tags: os
 
     # wal_level y listen_addresses solo toman efecto con restart
     - name: Aplicar cambios ahora
       ansible.builtin.meta: flush_handlers
+      tags: os
 
     - name: Postgres arriba y habilitado
       ansible.builtin.service:
         name: postgresql
         state: started
         enabled: true
+      tags: os
 
     - name: Password del usuario postgres
       community.postgresql.postgresql_user:
@@ -88,6 +106,7 @@
         password: "{{ db_password }}"
       become_user: postgres
       no_log: true
+      tags: db
 
     - name: Usuario de replicacion
       community.postgresql.postgresql_user:
@@ -96,17 +115,19 @@
         role_attr_flags: LOGIN,REPLICATION
       become_user: postgres
       no_log: true
+      tags: db
 
     - name: Base de datos {{ db_name }}
       community.postgresql.postgresql_db:
         name: "{{ db_name }}"
       become_user: postgres
+      tags: db
 
     # Secuencia por nodo: node_a genera impares (1,3,5..), node_b pares (2,4,6..)
     # y se engancha como DEFAULT de id, asi los IDs nunca chocan entre nodos.
     - name: Tabla mensajes con secuencia por nodo
       community.postgresql.postgresql_query:
-        db: "{{ db_name }}"
+        login_db: "{{ db_name }}"
         query: |
           CREATE SEQUENCE IF NOT EXISTS mensajes_id_seq START {{ node_index | int + 1 }} INCREMENT 2;
           CREATE TABLE IF NOT EXISTS mensajes (
@@ -119,10 +140,11 @@
           ALTER SEQUENCE mensajes_id_seq OWNED BY mensajes.id;
           GRANT SELECT ON mensajes TO replicator;
       become_user: postgres
+      tags: db
 
     - name: Publicacion de este nodo
       community.postgresql.postgresql_query:
-        db: "{{ db_name }}"
+        login_db: "{{ db_name }}"
         query: |
           DO $$
           BEGIN
@@ -132,6 +154,7 @@
           END
           $$;
       become_user: postgres
+      tags: db
 
   handlers:
     - name: Restart postgresql
@@ -143,13 +166,17 @@
   hosts: pg
   become: true
   gather_facts: false
+  tags: db
+  module_defaults:
+    group/community.postgresql.all:
+      login_unix_socket: "{{ pg_socket_dir }}"
   vars:
     sub_name: "sub_{{ inventory_hostname }}_from_{{ peer }}"
 
   tasks:
     - name: Ver si la suscripcion ya existe
       community.postgresql.postgresql_query:
-        db: "{{ db_name }}"
+        login_db: "{{ db_name }}"
         query: "SELECT 1 FROM pg_subscription WHERE subname = '{{ sub_name }}'"
       become_user: postgres
       register: sub_exists
@@ -157,9 +184,13 @@
 
     # CREATE SUBSCRIPTION no puede correr dentro de una transaccion -> autocommit.
     # copy_data = false: las tablas nacen vacias en ambos nodos.
+    # throttle: 1 -> UNA a la vez. En paralelo hay deadlock distribuido: cada
+    # CREATE SUBSCRIPTION deja su transaccion abierta mientras crea el slot en el
+    # otro nodo, y crear un slot espera a que terminen las transacciones abiertas.
     - name: Crear suscripcion a la publicacion del otro nodo
+      throttle: 1
       community.postgresql.postgresql_query:
-        db: "{{ db_name }}"
+        login_db: "{{ db_name }}"
         autocommit: true
         query: >-
           CREATE SUBSCRIPTION {{ sub_name }}
@@ -170,13 +201,14 @@
       when: sub_exists.rowcount == 0
       no_log: true
 
+    # >= 1: ademas del apply worker pueden aparecer workers de sync/parallel apply
     - name: Verificar que el worker de replicacion esta corriendo
       community.postgresql.postgresql_query:
-        db: "{{ db_name }}"
+        login_db: "{{ db_name }}"
         query: "SELECT count(*) AS n FROM pg_stat_subscription WHERE subname = '{{ sub_name }}' AND pid IS NOT NULL"
       become_user: postgres
       register: sub_status
-      until: sub_status.query_result[0].n | int == 1
+      until: sub_status.query_result[0].n | int >= 1
       retries: 15
       delay: 4
       changed_when: false
