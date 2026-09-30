@@ -144,7 +144,7 @@
   become: true
   gather_facts: false
   vars:
-    sub_name:"sub_{{ inventory_hostname }}_from_{{ peer }}"
+    sub_name: "sub_{{ inventory_hostname }}_from_{{ peer }}"
 
   tasks:
     - name: Ver si la suscripcion ya existe
