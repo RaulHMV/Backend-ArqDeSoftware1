@@ -1,0 +1,10 @@
+---
+db_name: demo
+pg_conf_dir: /etc/postgresql/16/main
+
+# "El otro" nodo: el unico host del grupo que no soy yo.
+peer: "{{ (groups['pg'] | difference([inventory_hostname])) | first }}"
+peer_ip: "{{ hostvars[peer].private_ip }}"
+
+# Viene del secret POSTGRES_PASSWORD de GitHub (nunca va en el repo).
+db_password: "{{ lookup('env', 'POSTGRES_PASSWORD') }}"

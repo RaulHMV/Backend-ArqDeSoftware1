@@ -45,6 +45,23 @@ Al final, en los outputs verás `api_endpoint`, `ws_endpoint`, `cognito_pool_id`
 
 ---
 
+## PostgreSQL maestro-maestro en 2 EC2 (stack aparte)
+
+Stack independiente del backend serverless: 2 EC2 (Ubuntu 24.04, `t3.micro`) con
+PostgreSQL 16 y replicación lógica bidireccional. Terraform crea las máquinas
+(`infra/environments/pg-multimaster`, state propio) y Ansible configura Postgres
+(`infra/ansible`).
+
+1. Crea el secret **`POSTGRES_PASSWORD`** (mín. 12 caracteres, solo `A-Za-z0-9_.-`).
+   Usa los mismos `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` y `AWS_REGION` de siempre.
+2. Actions → **pg-deploy** → `plan` para revisar, luego `apply` con `deploy` en **confirm**.
+3. Al terminar, el resumen del run trae las IPs de los nodos. Cada nodo escribe local y
+   replica al otro (`node_a` genera IDs impares, `node_b` pares).
+4. Actions → **pg-destroy** (`destroy` en confirm) cuando termines: las EC2 facturan
+   mientras existan y se pierden los datos.
+
+---
+
 ## Desarrollo local del backend
 
 ```bash
