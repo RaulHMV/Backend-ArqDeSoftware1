@@ -1,9 +1,9 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  account_id    = data.aws_caller_identity.current.account_id
-  state_bucket  = "${var.project}-tfstate-${local.account_id}"
-  lock_table    = "${var.project}-tf-locks"
+  account_id   = data.aws_caller_identity.current.account_id
+  state_bucket = "${var.project}-tfstate-${local.account_id}"
+  lock_table   = "${var.project}-tf-locks"
 }
 
 # ------------------------------------------------------------------
