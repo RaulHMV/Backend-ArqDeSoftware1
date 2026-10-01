@@ -29,6 +29,9 @@ Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Variable: `AWS_REGION`.
   Ansible va FIJO en un venv propio (Python 3.12, ansible-core 2.21.4,
   community.postgresql 5.0.0): NO usar el Ansible/colecciones preinstalados del runner.
   Si subes versiones, prueba antes: en c.postgresql 5 `db` ya es `login_db`.
+- `mysql-deploy.yml` / `mysql-destroy.yml`: igual que los pg-*, stack `mysql-multimaster`,
+  `concurrency: mysql-multimaster`. Reusa el MISMO secret `POSTGRES_PASSWORD` y la
+  variable `SSH_PUBLIC_KEY`. Colección fija: `ansible.mysql` 5.2.0.
 
 ## Reglas
 - Mantener deploy MANUAL; no agregar trigger `push`/auto salvo petición.

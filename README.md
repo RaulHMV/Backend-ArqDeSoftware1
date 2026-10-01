@@ -64,6 +64,24 @@ PostgreSQL 16 y replicación lógica bidireccional. Terraform crea las máquinas
 
 ---
 
+## MySQL maestro-maestro en 2 EC2 (stack aparte)
+
+Igual que el de Postgres pero con MySQL 8.0 (replicación por binlog con GTID, cada
+nodo es réplica del otro). Terraform en `infra/environments/mysql-multimaster` (state
+propio) y Ansible en `infra/ansible/mysql`.
+
+1. No necesitas nada nuevo: usa el **mismo** `POSTGRES_PASSWORD` y la **misma**
+   `SSH_PUBLIC_KEY` del stack de Postgres (más las llaves de AWS de siempre).
+2. Actions → **mysql-deploy** → `plan`, luego `apply` con `deploy` en **confirm**.
+3. Entra con `ssh ubuntu@<IP>` (IPs en el resumen del run) y luego `sudo mysql demo`.
+   `node_a` genera IDs impares y `node_b` pares.
+4. Actions → **mysql-destroy** (`destroy` en confirm) al terminar.
+
+> Con los dos stacks arriba son **4 EC2**: el free tier (750 h/mes) no alcanza para
+> tenerlas todas prendidas todo el mes. Levanta solo el que vayas a usar.
+
+---
+
 ## Desarrollo local del backend
 
 ```bash

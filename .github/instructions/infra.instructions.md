@@ -25,6 +25,12 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
 - `ansible/`: playbook Postgres 16 maestro-maestro (replicación lógica, `origin = none`).
   El inventario se genera en el workflow con `make_inventory.py` desde `terraform output`.
 
+- `environments/mysql-multimaster/` + `ansible/mysql/`: mismo patrón para MySQL 8.0
+  (puerto 3306, key `mysql-multimaster/terraform.tfstate`). Replicación binlog + GTID
+  con `SOURCE_AUTO_POSITION`. En MySQL el DDL SÍ se replica: usuario y esquema se crean
+  en cada nodo con `sql_log_bin = 0`. La 1a vez hace `RESET MASTER` (binlog de la
+  instalación sin GTID). Usa la colección `ansible.mysql` (community.mysql 5 solo redirige).
+
 ## Stack (modules/stack) — puntos clave
 - DynamoDB main (PK/SK, 4 GSIs, Streams NEW_AND_OLD_IMAGES, PITR en prod) + WSConnections.
 - Cognito (email username, `custom:areaId`, grupos Requester/Agent/Manager/Admin,

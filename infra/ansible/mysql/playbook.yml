@@ -1,0 +1,220 @@
+---
+# MySQL 8.0 maestro-maestro (replicacion por binlog con GTID) en 2 nodos.
+# Requiere en el entorno MYSQL_PASSWORD (el workflow le pasa el secret
+# POSTGRES_PASSWORD: mismo password que el stack de Postgres).
+#
+# Play 1: instala y configura MySQL, crea usuario de replicacion y esquema.
+# Play 2: cada nodo se vuelve replica del otro. Con GTID + SOURCE_AUTO_POSITION
+#         cada nodo ignora las transacciones que ya tiene: no hay bucle A->B->A.
+#
+# OJO: en MySQL el DDL TAMBIEN se replica. El usuario y el esquema se crean en
+# cada nodo con sql_log_bin = 0 (no van al binlog); solo los datos se replican.
+#
+# Tags: "os" = sistema operativo (apt, archivos de config, servicio);
+#       "db" = todo lo que se hace dentro de MySQL.
+
+- name: Preparar nodos MySQL
+  hosts: mysql
+  become: true
+  gather_facts: false
+  # root entra por auth_socket (sin password) porque Ansible corre como root.
+  module_defaults:
+    group/ansible.mysql.all:
+      login_unix_socket: "{{ mysql_socket }}"
+      login_user: root
+
+  pre_tasks:
+    - name: Esperar SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    # cloud-init todavia puede tener el lock de dpkg en el primer boot
+    - name: Esperar a que cloud-init termine
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      failed_when: cloud_init.rc not in [0, 2]
+      tags: os
+
+  tasks:
+    - name: Validar que llego el password
+      ansible.builtin.assert:
+        that: repl_password | length > 0
+        fail_msg: "Falta el password: revisa el secret POSTGRES_PASSWORD (el workflow lo pasa como MYSQL_PASSWORD)"
+      no_log: true
+      tags: db
+
+    - name: Validar formato de SSH_PUBLIC_KEY (si se dio)
+      ansible.builtin.assert:
+        that: extra_ssh_key is match('^ssh-(ed25519|rsa) ')
+        fail_msg: "SSH_PUBLIC_KEY debe ser una llave publica (ssh-ed25519 ... o ssh-rsa ...)"
+      when: extra_ssh_key | length > 0
+      tags: os
+
+    - name: Autorizar tu llave SSH para el usuario ubuntu
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        line: "{{ extra_ssh_key }}"
+      when: extra_ssh_key | length > 0
+      tags: os
+
+    # lock_timeout alto: en el primer boot unattended-upgrades puede tener
+    # el lock de dpkg varios minutos (el default de 60 s no alcanza).
+    - name: Instalar MySQL 8.0 y dependencias
+      ansible.builtin.apt:
+        name:
+          - mysql-server
+          - python3-pymysql
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 600
+      tags: os
+
+    # Ubuntu trae bind-address = 127.0.0.1 en mysqld.cnf: el otro nodo no podria
+    # conectarse. El security group limita 3306 a los 2 nodos.
+    - name: Escuchar en todas las interfaces
+      ansible.builtin.lineinfile:
+        path: "{{ mysql_conf_dir }}/mysqld.cnf"
+        regexp: '^bind-address\s*='
+        line: "bind-address = 0.0.0.0"
+      notify: Restart mysql
+      tags: os
+
+    - name: Configuracion de replicacion
+      ansible.builtin.copy:
+        dest: "{{ mysql_conf_dir }}/multimaster.cnf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [mysqld]
+          server_id = {{ node_index | int + 1 }}
+          log_bin = binlog
+          gtid_mode = ON
+          enforce_gtid_consistency = ON
+          log_replica_updates = ON
+          skip_name_resolve = ON
+          # node_a genera IDs impares (1,3,5..), node_b pares (2,4,6..): nunca chocan
+          auto_increment_increment = 2
+          auto_increment_offset = {{ node_index | int + 1 }}
+      notify: Restart mysql
+      tags: os
+
+    # server_id, gtid_mode y bind-address solo toman efecto con restart
+    - name: Aplicar cambios ahora
+      ansible.builtin.meta: flush_handlers
+      tags: os
+
+    - name: MySQL arriba y habilitado
+      ansible.builtin.service:
+        name: mysql
+        state: started
+        enabled: true
+      tags: os
+
+    - name: Estado de replicacion de este nodo
+      ansible.mysql.mysql_query:
+        query: SHOW REPLICA STATUS
+      register: replica_before
+      changed_when: false
+      tags: db
+
+    - name: Version de MySQL
+      ansible.mysql.mysql_query:
+        query: SELECT VERSION() AS v
+      register: mysql_version
+      changed_when: false
+      tags: db
+
+    # Solo la 1a vez (replica sin configurar): borra el binlog que dejo la
+    # instalacion, escrito sin GTID. Si se quedara, el otro nodo fallaria con
+    # "anonymous transaction" al replicar. No borra datos.
+    - name: Limpiar binlog antes de configurar la replicacion
+      ansible.mysql.mysql_query:
+        query: >-
+          {{ 'RESET BINARY LOGS AND GTIDS'
+             if (mysql_version.query_result[0][0].v.split('-') | first) is version('8.4', '>=')
+             else 'RESET MASTER' }}
+      when: replica_before.query_result[0] | length == 0
+      tags: db
+
+    - name: Usuario de replicacion (solo para el otro nodo, sin binlog)
+      ansible.mysql.mysql_query:
+        session_vars:
+          sql_log_bin: 0
+        query:
+          - CREATE USER IF NOT EXISTS 'replicator'@%(peer)s IDENTIFIED BY %(pw)s
+          - ALTER USER 'replicator'@%(peer)s IDENTIFIED BY %(pw)s
+          - GRANT REPLICATION SLAVE ON *.* TO 'replicator'@%(peer)s
+        named_args:
+          peer: "{{ peer_ip }}"
+          pw: "{{ repl_password }}"
+      no_log: true
+      tags: db
+
+    - name: Base de datos y tabla mensajes (en cada nodo, sin binlog)
+      ansible.mysql.mysql_query:
+        session_vars:
+          sql_log_bin: 0
+        query:
+          - CREATE DATABASE IF NOT EXISTS {{ db_name }}
+          - >-
+            CREATE TABLE IF NOT EXISTS {{ db_name }}.mensajes (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              nodo VARCHAR(32) NOT NULL DEFAULT '{{ inventory_hostname }}',
+              contenido VARCHAR(500) NOT NULL,
+              creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+      tags: db
+
+  handlers:
+    - name: Restart mysql
+      ansible.builtin.service:
+        name: mysql
+        state: restarted
+
+- name: Replicacion cruzada
+  hosts: mysql
+  become: true
+  gather_facts: false
+  tags: db
+  module_defaults:
+    group/ansible.mysql.all:
+      login_unix_socket: "{{ mysql_socket }}"
+      login_user: root
+
+  tasks:
+    - name: Ver si la replicacion ya esta configurada
+      ansible.mysql.mysql_query:
+        query: SHOW REPLICA STATUS
+      register: replica
+      changed_when: false
+
+    # SOURCE_SSL = 1: la replicacion viaja cifrada (y caching_sha2_password lo exige).
+    - name: Apuntar este nodo al otro y arrancar la replica
+      ansible.mysql.mysql_query:
+        query:
+          - >-
+            CHANGE REPLICATION SOURCE TO
+            SOURCE_HOST = %(host)s, SOURCE_PORT = 3306,
+            SOURCE_USER = 'replicator', SOURCE_PASSWORD = %(pw)s,
+            SOURCE_AUTO_POSITION = 1, SOURCE_SSL = 1
+          - START REPLICA
+        named_args:
+          host: "{{ peer_ip }}"
+          pw: "{{ repl_password }}"
+      when: replica.query_result[0] | length == 0
+      no_log: true
+
+    - name: Verificar que la replica corre (hilos IO y SQL en Yes)
+      ansible.mysql.mysql_query:
+        query: SHOW REPLICA STATUS
+      register: replica_status
+      until: >-
+        replica_status.query_result[0] | length > 0
+        and replica_status.query_result[0][0].Replica_IO_Running == 'Yes'
+        and replica_status.query_result[0][0].Replica_SQL_Running == 'Yes'
+      retries: 20
+      delay: 3
+      changed_when: false

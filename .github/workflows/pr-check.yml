@@ -54,3 +54,9 @@ jobs:
           terraform init -backend=false -input=false
           terraform validate
         working-directory: infra/environments/pg-multimaster
+
+      - name: Validate mysql-multimaster
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+        working-directory: infra/environments/mysql-multimaster
