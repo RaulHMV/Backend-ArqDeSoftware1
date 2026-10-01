@@ -40,6 +40,8 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
+          # Sin wrapper: necesitamos la salida limpia de `terraform output`.
+          terraform_wrapper: false
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -52,6 +54,38 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform init -input=false
 
+      # IDs antes de borrar, para confirmar despues que AWS si las elimino.
+      - name: Guardar IDs de las instancias
+        id: ids
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          ids=$(terraform output -json nodes 2>/dev/null | jq -r '[.[].instance_id] | join(" ")') || ids=""
+          echo "ids=$ids" >> "$GITHUB_OUTPUT"
+
+      # destroy TERMINA (borra) las EC2 con su disco, y borra SG, reglas y key pair.
       - name: Terraform Destroy
         working-directory: ${{ env.TF_DIR }}
         run: terraform destroy -auto-approve -input=false
+
+      - name: Confirmar que AWS las elimino
+        env:
+          IDS: ${{ steps.ids.outputs.ids }}
+        run: |
+          read -ra ids <<< "$IDS"
+          {
+            echo "### Recursos eliminados (mysql-multimaster)"
+            echo
+            if (( ${#ids[@]} > 0 )); then
+              aws ec2 wait instance-terminated --instance-ids "${ids[@]}"
+              echo "| Instancia | Estado |"
+              echo "|---|---|"
+              aws ec2 describe-instances --instance-ids "${ids[@]}" \
+                --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text \
+                | awk '{print "| " $1 " | " $2 " |"}'
+            else
+              echo "No habia instancias en el state (ya estaba destruido)."
+            fi
+            echo
+            echo "**terminated = borrada** (con su disco); ya no cobra. La consola de AWS la sigue"
+            echo "mostrando ~1 h y luego desaparece sola. SG, reglas y key pair tambien se borraron."
+          } >> "$GITHUB_STEP_SUMMARY"
