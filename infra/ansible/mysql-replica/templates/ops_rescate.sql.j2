@@ -1,0 +1,218 @@
+-- KIT DE RESCATE (se instala en el MAESTRO cuando la replica YA esta mal).
+-- Idempotente. Lo usa files/rescate_binlog.py, que lee el binlog del esclavo y deja
+-- aqui cada cambio hecho directo en el esclavo con su fila ANTES y DESPUES.
+
+CREATE DATABASE IF NOT EXISTS ops;
+
+-- Cada cambio encontrado en el binlog del esclavo y que se hizo con el. Tambien es el
+-- respaldo de SOLO lo afectado: antes = esclavo antes del cambio, en_maestro = maestro
+-- antes de reconciliar, despues = lo que habia escrito el esclavo.
+CREATE TABLE IF NOT EXISTS ops.rescate (
+  uid               CHAR(40)     NOT NULL PRIMARY KEY COMMENT 'archivo_binlog:posicion:fila',
+  tabla             VARCHAR(64)  NOT NULL,
+  op                ENUM('INSERT','UPDATE','DELETE') NOT NULL,
+  pk                BIGINT       NOT NULL,
+  antes             JSON         NULL,
+  despues           JSON         NULL,
+  cuando            TIMESTAMP(6) NOT NULL,
+  resultado         ENUM('pendiente','aplicado','ya_estaba','conflicto') NOT NULL DEFAULT 'pendiente',
+  en_maestro        JSON         NULL,
+  detalle           VARCHAR(255) NULL,
+  esclavo_corregido TINYINT      NOT NULL DEFAULT 0,
+  procesado_en      TIMESTAMP(6) NULL
+);
+
+-- Bitacora: una fila por cada corrida del rescate (diagnostico o rescatar).
+CREATE TABLE IF NOT EXISTS ops.incidentes (
+  id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  cuando             TIMESTAMP(6)    NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  modo               VARCHAR(16)     NOT NULL,
+  cambios_esclavo    INT NOT NULL DEFAULT 0,
+  aplicados          INT NOT NULL DEFAULT 0,
+  ya_estaban         INT NOT NULL DEFAULT 0,
+  conflictos         INT NOT NULL DEFAULT 0,
+  filas_corregidas   INT NOT NULL DEFAULT 0,
+  gtids_limpiados    INT NOT NULL DEFAULT 0,
+  replica_antes      VARCHAR(255)    NULL,
+  replica_despues    VARCHAR(255)    NULL,
+  verificacion       VARCHAR(255)    NULL
+);
+
+-- Hasta donde ya se leyo el binlog del esclavo (la siguiente corrida sigue de ahi).
+CREATE TABLE IF NOT EXISTS ops.checkpoint (
+  id             TINYINT      NOT NULL PRIMARY KEY,
+  archivo        VARCHAR(255) NOT NULL,
+  posicion       BIGINT       NOT NULL,
+  actualizado_en TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+);
+
+-- Metadatos para que reconciliar() sirva para cualquier tabla (los genera registrar_tablas).
+CREATE TABLE IF NOT EXISTS ops.tablas (
+  tabla       VARCHAR(64)  NOT NULL PRIMARY KEY,
+  pk          VARCHAR(64)  NOT NULL,
+  json_expr   MEDIUMTEXT   NOT NULL,
+  cols        MEDIUMTEXT   NOT NULL,
+  vals_expr   MEDIUMTEXT   NOT NULL,
+  set_expr    MEDIUMTEXT   NOT NULL
+);
+
+-- registrar_tablas(): lee information_schema y genera las expresiones de cada tabla de
+-- {{ db_name }} con PK de UNA columna. (Valor de JSON a columna con JSON_EXTRACT y no con
+-- JSON_VALUE: JSON_VALUE corta en silencio los textos de mas de 512 caracteres.)
+DROP PROCEDURE IF EXISTS ops.registrar_tablas;
+DELIMITER //
+CREATE PROCEDURE ops.registrar_tablas()
+BEGIN
+  SET SESSION group_concat_max_len = 1000000;
+  DELETE FROM ops.tablas;
+  INSERT INTO ops.tablas (tabla, pk, json_expr, cols, vals_expr, set_expr)
+  SELECT c.TABLE_NAME, k.COLUMN_NAME,
+         CONCAT('JSON_OBJECT(', GROUP_CONCAT(CONCAT('''', c.COLUMN_NAME, ''', `', c.COLUMN_NAME, '`')
+                                             ORDER BY c.ORDINAL_POSITION SEPARATOR ', '), ')'),
+         GROUP_CONCAT(CONCAT('`', c.COLUMN_NAME, '`') ORDER BY c.ORDINAL_POSITION SEPARATOR ', '),
+         GROUP_CONCAT(CONCAT('IF(JSON_TYPE(JSON_EXTRACT(@fila, ''$."', c.COLUMN_NAME, '"'')) = ''NULL'', NULL, ',
+                             'JSON_UNQUOTE(JSON_EXTRACT(@fila, ''$."', c.COLUMN_NAME, '"'')))')
+                      ORDER BY c.ORDINAL_POSITION SEPARATOR ', '),
+         GROUP_CONCAT(IF(c.COLUMN_NAME = k.COLUMN_NAME, NULL,
+                         CONCAT('`', c.COLUMN_NAME, '` = IF(JSON_TYPE(JSON_EXTRACT(@fila, ''$."', c.COLUMN_NAME,
+                                '"'')) = ''NULL'', NULL, JSON_UNQUOTE(JSON_EXTRACT(@fila, ''$."', c.COLUMN_NAME, '"'')))'))
+                      ORDER BY c.ORDINAL_POSITION SEPARATOR ', ')
+    FROM information_schema.COLUMNS c
+    JOIN (SELECT TABLE_NAME, MIN(COLUMN_NAME) AS COLUMN_NAME
+            FROM information_schema.KEY_COLUMN_USAGE
+           WHERE TABLE_SCHEMA = '{{ db_name }}' AND CONSTRAINT_NAME = 'PRIMARY'
+           GROUP BY TABLE_NAME HAVING COUNT(*) = 1) k ON k.TABLE_NAME = c.TABLE_NAME
+   WHERE c.TABLE_SCHEMA = '{{ db_name }}'
+   GROUP BY c.TABLE_NAME, k.COLUMN_NAME;
+END//
+DELIMITER ;
+
+-- reconciliar(): decide cada cambio pendiente (llamar con time_zone = '+00:00').
+-- Regla: un UPDATE/DELETE se aplica solo si la fila del maestro sigue IGUAL a como estaba
+-- en el esclavo antes del cambio (nadie la toco). Si no: conflicto, GANA EL MAESTRO (el
+-- rescate luego deja la fila del esclavo igual a la del maestro).
+DROP PROCEDURE IF EXISTS ops.reconciliar;
+DELIMITER //
+CREATE PROCEDURE ops.reconciliar(OUT p_aplicados INT, OUT p_ya INT, OUT p_conflictos INT)
+BEGIN
+  DECLARE v_fin BOOL DEFAULT FALSE;
+  DECLARE v_uid CHAR(40);
+  DECLARE v_tabla VARCHAR(64);
+  DECLARE v_op VARCHAR(8);
+  DECLARE v_pk BIGINT;
+  DECLARE v_antes, v_despues, v_actual JSON;
+  DECLARE v_res VARCHAR(16);
+  DECLARE v_det VARCHAR(255);
+  DECLARE v_err INT DEFAULT 0;
+  DECLARE v_msg TEXT;
+  DECLARE cur CURSOR FOR
+    SELECT uid, tabla, op, pk, antes, despues FROM ops.rescate
+    WHERE resultado = 'pendiente' ORDER BY uid;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_fin = TRUE;
+
+  SET p_aplicados = 0, p_ya = 0, p_conflictos = 0;
+  OPEN cur;
+  lazo: LOOP
+    FETCH cur INTO v_uid, v_tabla, v_op, v_pk, v_antes, v_despues;
+    IF v_fin THEN LEAVE lazo; END IF;
+
+    SELECT pk, json_expr, cols, vals_expr, set_expr
+      INTO @t_pk, @t_json, @t_cols, @t_vals, @t_set
+      FROM ops.tablas WHERE tabla = v_tabla;
+
+    -- Fila actual del maestro (NULL si no existe). Subconsulta escalar: sin filas da NULL
+    -- sin disparar NOT FOUND (eso cortaria el lazo del cursor).
+    SET @actual = NULL;
+    SET @q = CONCAT('SET @actual = (SELECT CAST(', @t_json, ' AS CHAR) FROM `{{ db_name }}`.`', v_tabla,
+                    '` WHERE `', @t_pk, '` = ', v_pk, ')');
+    PREPARE s FROM @q; EXECUTE s; DEALLOCATE PREPARE s;
+    -- A variable local JSON con CONVERT explicito: si una vuelta anterior dejo @actual en
+    -- NULL, MySQL la sigue tratando como binario y la comparacion nunca coincidiria.
+    SET v_actual = CAST(CONVERT(@actual USING utf8mb4) AS JSON);
+
+    SET v_res = NULL, v_det = NULL, v_err = 0;
+
+    IF (v_op = 'INSERT' AND v_actual IS NULL)
+       OR (v_op = 'UPDATE' AND v_actual = v_antes)
+       OR (v_op = 'DELETE' AND v_actual = v_antes) THEN
+      -- Seguro: aplicar en el maestro SIN binlog. El esclavo ya lo tiene; si se replicara,
+      -- lo recibiria dos veces y la replica tronaria.
+      SET @fila = CAST(v_despues AS CHAR CHARACTER SET utf8mb4);
+      IF v_op = 'INSERT' THEN
+        SET @q = CONCAT('INSERT INTO `{{ db_name }}`.`', v_tabla, '` (', @t_cols, ') VALUES (', @t_vals, ')');
+      ELSEIF v_op = 'UPDATE' THEN
+        SET @q = CONCAT('UPDATE `{{ db_name }}`.`', v_tabla, '` SET ', @t_set, ' WHERE `', @t_pk, '` = ', v_pk);
+      ELSE
+        SET @q = CONCAT('DELETE FROM `{{ db_name }}`.`', v_tabla, '` WHERE `', @t_pk, '` = ', v_pk);
+      END IF;
+      BEGIN
+        -- UNIQUE, FK, etc.: no se aplica, queda como conflicto
+        DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+        BEGIN
+          GET DIAGNOSTICS CONDITION 1 v_msg = MESSAGE_TEXT;
+          SET v_err = 1;
+        END;
+        SET SESSION sql_log_bin = 0;
+        PREPARE s FROM @q; EXECUTE s; DEALLOCATE PREPARE s;
+        SET SESSION sql_log_bin = 1;
+      END;
+      IF v_err = 1 THEN
+        SET v_res = 'conflicto', v_det = LEFT(CONCAT('no se pudo aplicar: ', v_msg), 255);
+      ELSE
+        SET v_res = 'aplicado';
+      END IF;
+    ELSEIF (v_op = 'INSERT' AND v_actual = v_despues)
+        OR (v_op = 'UPDATE' AND v_actual = v_despues)
+        OR (v_op = 'DELETE' AND v_actual IS NULL) THEN
+      SET v_res = 'ya_estaba';
+    ELSE
+      SET v_res = 'conflicto',
+          v_det = CASE v_op
+                    WHEN 'INSERT' THEN 'la PK ya existe en el maestro con otros datos; gana el maestro'
+                    ELSE 'la fila cambio tambien en el maestro; gana el maestro' END;
+    END IF;
+
+    UPDATE ops.rescate
+       SET resultado = v_res, detalle = v_det, en_maestro = v_actual, procesado_en = NOW(6)
+     WHERE uid = v_uid;
+
+    IF v_res = 'aplicado' THEN SET p_aplicados = p_aplicados + 1;
+    ELSEIF v_res = 'ya_estaba' THEN SET p_ya = p_ya + 1;
+    ELSE SET p_conflictos = p_conflictos + 1;
+    END IF;
+  END LOOP;
+  CLOSE cur;
+END//
+DELIMITER ;
+
+-- inyectar_gtids(): SOLO si la replica usa GTID. Registra en el maestro transacciones
+-- VACIAS con los GTIDs que solo tiene el esclavo, para que ambos tengan el mismo
+-- historial y el esclavo pueda volverse maestro sin mandar "datos fantasma".
+DROP PROCEDURE IF EXISTS ops.inyectar_gtids;
+DELIMITER //
+CREATE PROCEDURE ops.inyectar_gtids(IN p_set TEXT, IN p_max INT, OUT p_n INT)
+BEGIN
+  DECLARE v_rest, v_parte, v_uuid, v_ints, v_int TEXT;
+  DECLARE a, b BIGINT;
+  SET p_n = 0, v_rest = REPLACE(REPLACE(IFNULL(p_set, ''), '\n', ''), ' ', '');
+  WHILE v_rest <> '' AND p_n < p_max DO
+    SET v_parte = SUBSTRING_INDEX(v_rest, ',', 1);
+    SET v_rest = IF(LOCATE(',', v_rest) > 0, SUBSTRING(v_rest, LOCATE(',', v_rest) + 1), '');
+    SET v_uuid = SUBSTRING_INDEX(v_parte, ':', 1);
+    SET v_ints = SUBSTRING(v_parte, CHAR_LENGTH(v_uuid) + 2);
+    WHILE v_ints <> '' AND p_n < p_max DO
+      SET v_int = SUBSTRING_INDEX(v_ints, ':', 1);
+      SET v_ints = IF(LOCATE(':', v_ints) > 0, SUBSTRING(v_ints, LOCATE(':', v_ints) + 1), '');
+      SET a = CAST(SUBSTRING_INDEX(v_int, '-', 1) AS UNSIGNED),
+          b = CAST(SUBSTRING_INDEX(v_int, '-', -1) AS UNSIGNED);
+      WHILE a <= b AND p_n < p_max DO
+        SET @g = CONCAT(v_uuid, ':', a);
+        SET GTID_NEXT = @g;
+        START TRANSACTION; COMMIT;
+        SET GTID_NEXT = 'AUTOMATIC';
+        SET a = a + 1, p_n = p_n + 1;
+      END WHILE;
+    END WHILE;
+  END WHILE;
+END//
+DELIMITER ;

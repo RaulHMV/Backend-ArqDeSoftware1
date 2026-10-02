@@ -32,6 +32,9 @@ Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Variable: `AWS_REGION`.
 - `mysql-deploy.yml` / `mysql-destroy.yml`: igual que los pg-*, stack `mysql-multimaster`,
   `concurrency: mysql-multimaster`. Reusa el MISMO secret `POSTGRES_PASSWORD` y la
   variable `SSH_PUBLIC_KEY`. Colección fija: `ansible.mysql` 5.2.0.
+- `mysql-replica-deploy.yml` / `mysql-replica-destroy.yml` / `mysql-replica-rescate.yml`:
+  stack `mysql-replica`, `concurrency: mysql-replica`, mismos secrets/vars que mysql-*.
+  rescate: modo diagnostico|rescatar (confirm `rescatar`), bloquear si|no; no crea EC2.
 
 ## Reglas
 - Mantener deploy MANUAL; no agregar trigger `push`/auto salvo petición.

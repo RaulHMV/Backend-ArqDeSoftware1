@@ -31,6 +31,16 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
   en cada nodo con `sql_log_bin = 0`. La 1a vez hace `RESET MASTER` (binlog de la
   instalación sin GTID). Usa la colección `ansible.mysql` (community.mysql 5 solo redirige).
 
+- `environments/mysql-replica/` + `ansible/mysql-replica/`: maestro-esclavo configurado MAL a
+  propósito (esclavo escribible, sin GTID, por posición) en `playbook.yml`, y kit de rescate
+  en `rescate.yml`: `files/rescate_binlog.py` (lee el binlog del esclavo con mysql-replication,
+  filtra por server_id, mapea columnas por posición porque binlog_row_metadata=MINIMAL) +
+  `templates/ops_rescate.sql.j2` (`ops.reconciliar()` compara la imagen "antes" con el maestro,
+  aplica con sql_log_bin=0, conflictos -> gana el maestro). Réplica se pone al día en modo
+  IDEMPOTENT y vuelve a STRICT; verificación con CHECKSUM TABLE. Probado con y sin GTID.
+  Gotchas probados: comparar JSON vía variable local tipada (no `@var`), TIMESTAMP en UTC,
+  JSON_VALUE corta a 512 chars (se usa JSON_EXTRACT).
+
 ## Stack (modules/stack) — puntos clave
 - DynamoDB main (PK/SK, 4 GSIs, Streams NEW_AND_OLD_IMAGES, PITR en prod) + WSConnections.
 - Cognito (email username, `custom:areaId`, grupos Requester/Agent/Manager/Admin,

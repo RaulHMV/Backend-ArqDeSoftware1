@@ -19,6 +19,7 @@ ticket-system/
   .github/    workflows (bootstrap, pr-check, deploy, pg-*, mysql-*) + instructions
   infra/ansible + infra/environments/pg-multimaster: Postgres maestro-maestro en 2 EC2 (aparte)
   infra/ansible/mysql + infra/environments/mysql-multimaster: MySQL maestro-maestro en 2 EC2 (aparte)
+  infra/ansible/mysql-replica + infra/environments/mysql-replica: MySQL maestro-esclavo MAL hecho + rescate desde binlog (aparte)
 ```
 
 ## Datos AWS

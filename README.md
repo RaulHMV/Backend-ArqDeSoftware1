@@ -82,6 +82,28 @@ propio) y Ansible en `infra/ansible/mysql`.
 
 ---
 
+## MySQL maestro-esclavo MAL HECHO + rescate (stack aparte)
+
+Simula la réplica de producción que **ya estaba mal configurada** y cómo arreglarla
+**sin borrar ni reclonar nada**.
+
+1. Actions → **mysql-replica-deploy** (`apply` + `deploy`): maestro con 1000 clientes y un
+   esclavo configurado "de tutorial": **acepta escrituras**, sin GTID, sin protección.
+2. Simula el problema: en el **esclavo** haz INSERT/UPDATE/DELETE en `demo.clientes`
+   (si cambias las mismas filas en el maestro, la réplica truena).
+3. Actions → **mysql-replica-rescate**:
+   - `diagnostico`: lista lo que se escribió en el esclavo y qué pasaría con cada cambio.
+   - `rescatar` (confirm `rescatar`): lee el **binlog del esclavo** (guarda cada fila antes y
+     después), aplica en el maestro lo que nadie más tocó, registra los conflictos (gana el
+     maestro), corrige solo esas filas en el esclavo, revive la réplica y verifica con
+     checksum que ambos quedan iguales. Con `bloquear=si` deja el esclavo en solo lectura.
+4. Resultados en el maestro: `SELECT * FROM ops.rescate;` y `SELECT * FROM ops.incidentes;`.
+5. **mysql-replica-destroy** al terminar.
+
+Usa el mismo `POSTGRES_PASSWORD` y `SSH_PUBLIC_KEY` que los otros stacks.
+
+---
+
 ## Desarrollo local del backend
 
 ```bash

@@ -1,0 +1,35 @@
+---
+db_name: demo
+mysql_conf_dir: /etc/mysql/mysql.conf.d
+mysql_socket: /var/run/mysqld/mysqld.sock
+
+# Roles por indice del inventario: node_index 0 = maestro, 1 = esclavo.
+master_host: "{{ groups['mysql'] | map('extract', hostvars) | selectattr('node_index', 'equalto', 0) | map(attribute='inventory_hostname') | first }}"
+replica_host: "{{ groups['mysql'] | map('extract', hostvars) | selectattr('node_index', 'equalto', 1) | map(attribute='inventory_hostname') | first }}"
+master_ip: "{{ hostvars[master_host].private_ip }}"
+replica_ip: "{{ hostvars[replica_host].private_ip }}"
+is_master: "{{ node_index | int == 0 }}"
+
+# Desde que IP llega el esclavo al maestro (en AWS su IP privada; la prueba local lo cambia).
+replica_client_host: "{{ replica_ip }}"
+
+# Filas de "produccion" que se cargan en el maestro al desplegar.
+demo_filas: 1000
+
+# Replica "de tutorial" (a proposito mal): sin GTID, por posicion de binlog.
+# (true solo para probar que el rescate tambien funciona con GTID.)
+usar_gtid: false
+
+# Tu llave publica para entrar por SSH a mano (variable SSH_PUBLIC_KEY de GitHub).
+extra_ssh_key: "{{ lookup('env', 'SSH_PUBLIC_KEY') }}"
+
+# Password de replicator/rescate: el workflow le pasa el MISMO secret POSTGRES_PASSWORD
+# que usan los otros stacks. Nunca va en el repo.
+repl_password: "{{ lookup('env', 'MYSQL_PASSWORD') }}"
+
+# --- Kit de rescate (rescate.yml) ---
+rescate_dir: /opt/mysql-rescate
+rescate_python: "{{ rescate_dir }}/venv/bin/python"
+rescate_sql_path: /root/ops_rescate.sql
+modo: diagnostico          # diagnostico | rescatar  (lo pasa el workflow)
+bloquear: "si"             # si = dejar el esclavo en solo lectura al terminar

@@ -1,0 +1,134 @@
+---
+# Rescate de la replica MAL HECHA, sin borrar ni reclonar nada.
+#   -e modo=diagnostico   solo informa que encontro (no cambia nada)
+#   -e modo=rescatar      arregla: rescata al maestro lo escrito en el esclavo, corrige
+#                         conflictos, revive la replica y verifica
+#   -e bloquear=si|no     dejar (o no) el esclavo en solo lectura al terminar
+# Requiere MYSQL_PASSWORD en el entorno (el workflow le pasa POSTGRES_PASSWORD).
+
+- name: Maestro - instalar el kit de rescate (tablas ops.* y procedimientos)
+  hosts: mysql
+  become: true
+  gather_facts: false
+  tags: db
+  module_defaults:
+    group/ansible.mysql.all:
+      login_unix_socket: "{{ mysql_socket }}"
+      login_user: root
+
+  tasks:
+    - name: Validar parametros
+      ansible.builtin.assert:
+        that:
+          - modo in ['diagnostico', 'rescatar']
+          - bloquear in ['si', 'no']
+          - repl_password | length > 0
+        fail_msg: "modo debe ser diagnostico|rescatar, bloquear si|no, y debe llegar MYSQL_PASSWORD"
+      no_log: true
+
+    - name: SQL del kit
+      ansible.builtin.template:
+        src: ops_rescate.sql.j2
+        dest: "{{ rescate_sql_path }}"
+        mode: "0600"
+      when: is_master | bool
+
+    - name: Crear/actualizar kit en el maestro
+      ansible.builtin.shell: >-
+        mysql --socket={{ mysql_socket }} -uroot --default-character-set=utf8mb4
+        < {{ rescate_sql_path }}
+      when: is_master | bool
+      changed_when: true
+
+    # El rescate se conecta desde el esclavo. Puede leer demo y escribir SOLO en ops:
+    # los cambios a los datos los hace ops.reconciliar() con sus propias reglas.
+    - name: Usuario 'rescate' para el esclavo
+      ansible.mysql.mysql_query:
+        query:
+          - CREATE USER IF NOT EXISTS 'rescate'@%(ip)s IDENTIFIED BY %(pw)s
+          - ALTER USER 'rescate'@%(ip)s IDENTIFIED BY %(pw)s
+          - GRANT SELECT ON {{ db_name }}.* TO 'rescate'@%(ip)s
+          - GRANT SELECT, INSERT, UPDATE, EXECUTE ON ops.* TO 'rescate'@%(ip)s
+          - GRANT REPLICATION CLIENT ON *.* TO 'rescate'@%(ip)s
+        named_args:
+          ip: "{{ replica_client_host }}"
+          pw: "{{ repl_password }}"
+      when: is_master | bool
+      no_log: true
+
+- name: Esclavo - correr el rescate
+  hosts: mysql
+  become: true
+  gather_facts: false
+  tags: db
+
+  tasks:
+    - name: Carpeta de la herramienta
+      ansible.builtin.file:
+        path: "{{ rescate_dir }}"
+        state: directory
+        mode: "0700"
+      when: not (is_master | bool)
+
+    - name: python3-venv para la herramienta
+      ansible.builtin.apt:
+        name: python3-venv
+        state: present
+        lock_timeout: 600
+      when: not (is_master | bool)
+      tags: os
+
+    # Versiones FIJAS (las probadas). mysql-replication lee el binlog como lo haria
+    # un esclavo: es lo unico que no se puede hacer desde SQL.
+    - name: Entorno de la herramienta
+      ansible.builtin.pip:
+        name:
+          - mysql-replication==1.0.17
+          - PyMySQL==1.2.3
+        virtualenv: "{{ rescate_dir }}/venv"
+        virtualenv_command: python3 -m venv
+      when: not (is_master | bool)
+      tags: os
+
+    - name: Herramienta de rescate
+      ansible.builtin.copy:
+        src: rescate_binlog.py
+        dest: "{{ rescate_dir }}/rescate_binlog.py"
+        mode: "0755"
+      when: not (is_master | bool)
+
+    - name: Rescate ({{ modo }})
+      ansible.builtin.command:
+        argv:
+          - "{{ rescate_python }}"
+          - "{{ rescate_dir }}/rescate_binlog.py"
+          - --modo={{ modo }}
+          - --db={{ db_name }}
+          - --esclavo-socket={{ mysql_socket }}
+          - --maestro-host={{ master_ip }}
+          - --bloquear={{ bloquear }}
+          - --informe={{ rescate_dir }}/informe.md
+      environment:
+        RESCATE_PASSWORD: "{{ repl_password }}"
+      register: rescate
+      changed_when: modo == 'rescatar'
+      failed_when: false            # primero se muestra y se trae el informe; abajo se valida
+      when: not (is_master | bool)
+
+    - name: Informe
+      ansible.builtin.debug:
+        msg: "{{ rescate.stdout_lines }}"
+      when: not (is_master | bool)
+
+    - name: Traer el informe (para el resumen del workflow)
+      ansible.builtin.fetch:
+        src: "{{ rescate_dir }}/informe.md"
+        dest: "{{ informe_local | default('informe_rescate.md') }}"
+        flat: true
+      when: not (is_master | bool)
+
+    - name: Resultado del rescate
+      ansible.builtin.assert:
+        that: rescate.rc == 0
+        fail_msg: "El rescate termino con codigo {{ rescate.rc }} (1 = verificacion fallo, 2 = no se puede rescatar). Revisa el informe."
+      when: not (is_master | bool)

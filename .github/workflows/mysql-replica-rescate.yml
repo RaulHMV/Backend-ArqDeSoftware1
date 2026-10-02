@@ -1,0 +1,135 @@
+name: mysql-replica-rescate
+
+# Rescata la replica MAL HECHA (stack mysql-replica) SIN borrar ni reclonar nada:
+# lee el binlog del esclavo, separa lo que se escribio directo ahi, lo reconcilia en el
+# maestro (aplica lo seguro, registra conflictos: gana el maestro), corrige las filas en
+# conflicto del esclavo, revive la replica y verifica que ambos queden iguales.
+#
+# MANUAL. En GitHub > Actions > mysql-replica-rescate > Run workflow:
+#   - modo: diagnostico (solo informa, no cambia nada) o rescatar (arregla).
+#   - bloquear: si = dejar el esclavo en solo lectura al terminar (cerrar la causa);
+#               no = dejarlo escribible (para repetir la demo).
+#   - confirm: para rescatar, escribe "rescatar".
+# No crea ni destruye EC2: usa las del ultimo mysql-replica-deploy.
+# Requisitos: los mismos secrets/vars de mysql-replica-deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "Que hacer"
+        required: true
+        default: diagnostico
+        type: choice
+        options:
+          - diagnostico
+          - rescatar
+      bloquear:
+        description: "Dejar el esclavo en solo lectura al terminar"
+        required: true
+        default: "si"
+        type: choice
+        options:
+          - "si"
+          - "no"
+      confirm:
+        description: 'Para "rescatar" escribe: rescatar'
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mysql-replica
+  cancel-in-progress: false
+
+env:
+  TF_DIR: infra/environments/mysql-replica
+  ANSIBLE_DIR: infra/ansible/mysql-replica
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+
+jobs:
+  rescate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar confirmacion (solo rescatar)
+        if: ${{ inputs.modo == 'rescatar' && inputs.confirm != 'rescatar' }}
+        run: |
+          echo "::error::Para 'rescatar' debes escribir 'rescatar' en el campo confirm."
+          exit 1
+
+      - name: Validar password
+        env:
+          DB_PASS: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          if [[ ! "$DB_PASS" =~ ^[A-Za-z0-9_.-]{12,}$ ]]; then
+            echo "::error::POSTGRES_PASSWORD debe existir, tener >=12 caracteres y solo [A-Za-z0-9_.-]."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          # Sin wrapper: necesitamos la salida limpia de `terraform output`.
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Llave SSH e inventario (de las EC2 ya desplegadas)
+        run: |
+          if ! terraform -chdir="$TF_DIR" output -json nodes > "$RUNNER_TEMP/nodes.json" 2>/dev/null \
+             || [[ "$(jq 'length' "$RUNNER_TEMP/nodes.json")" != 2 ]]; then
+            echo "::error::No hay replica desplegada. Corre primero mysql-replica-deploy (apply)."
+            exit 1
+          fi
+          KEY="$RUNNER_TEMP/mysql_key"
+          terraform -chdir="$TF_DIR" output -raw ssh_private_key > "$KEY"
+          chmod 600 "$KEY"
+          python3 infra/ansible/make_inventory.py "$RUNNER_TEMP/nodes.json" "$KEY" mysql > "$RUNNER_TEMP/inventory.json"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Mismas versiones FIJAS que el deploy (las probadas).
+      - name: Instalar Ansible
+        run: |
+          python -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/pip" install --quiet "ansible-core==2.21.4"
+          "$RUNNER_TEMP/ansible-venv/bin/ansible-galaxy" collection install \
+            "ansible.mysql:==5.2.0" -p "$RUNNER_TEMP/collections"
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/collections" >> "$GITHUB_ENV"
+
+      - name: Rescate (${{ inputs.modo }})
+        working-directory: ${{ env.ANSIBLE_DIR }}
+        env:
+          MYSQL_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          MODO: ${{ inputs.modo }}
+          BLOQUEAR: ${{ inputs.bloquear }}
+        run: >-
+          ansible-playbook -i "$RUNNER_TEMP/inventory.json" rescate.yml
+          -e "modo=$MODO" -e "bloquear=$BLOQUEAR" -e "informe_local=$RUNNER_TEMP/informe.md"
+
+      # Aunque el rescate falle, el informe explica que encontro y que paso.
+      - name: Informe en el resumen
+        if: ${{ always() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/informe.md" ]]; then
+            cat "$RUNNER_TEMP/informe.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No se genero informe (el rescate no llego a correr; revisa los logs)." >> "$GITHUB_STEP_SUMMARY"
+          fi
