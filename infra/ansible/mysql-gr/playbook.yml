@@ -1,0 +1,297 @@
+---
+# MySQL 8.0 Group Replication multi-primary: 4 maestros, todos aceptan escrituras.
+# Antes de confirmar cada transaccion el grupo revisa si otro nodo toco las mismas
+# filas: si si, la segunda falla con error (la app reintenta) y los datos NUNCA divergen.
+# Funciona mientras haya mayoria (3 de 4): aguanta 1 nodo caido.
+#
+# Requiere en el entorno MYSQL_PASSWORD (el workflow le pasa POSTGRES_PASSWORD).
+# Tags: "os" = sistema operativo; "config" = archivos de config; "db" = dentro de MySQL.
+# Idempotente: re-correrlo tambien sirve para RECUPERAR el grupo si se apagaron todos.
+
+- name: Preparar los nodos
+  hosts: mysql
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Esperar SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Esperar a que cloud-init termine
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      failed_when: cloud_init.rc not in [0, 2]
+      tags: os
+
+  tasks:
+    - name: Validar que llego el password
+      ansible.builtin.assert:
+        that: repl_password | length > 0
+        fail_msg: "Falta el password: revisa el secret POSTGRES_PASSWORD (el workflow lo pasa como MYSQL_PASSWORD)"
+      no_log: true
+      tags: db
+
+    - name: Validar formato de SSH_PUBLIC_KEY (si se dio)
+      ansible.builtin.assert:
+        that: extra_ssh_key is match('^ssh-(ed25519|rsa) ')
+        fail_msg: "SSH_PUBLIC_KEY debe ser una llave publica (ssh-ed25519 ... o ssh-rsa ...)"
+      when: extra_ssh_key | length > 0
+      tags: os
+
+    - name: Autorizar tu llave SSH para el usuario ubuntu
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        line: "{{ extra_ssh_key }}"
+      when: extra_ssh_key | length > 0
+      tags: os
+
+    - name: Instalar MySQL 8.0 y dependencias
+      ansible.builtin.apt:
+        name:
+          - mysql-server
+          - python3-pymysql
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 600
+      tags: os
+
+    # Ubuntu trae bind-address = 127.0.0.1; el SG limita 3306 y 33061 a los nodos.
+    - name: Escuchar en todas las interfaces
+      ansible.builtin.lineinfile:
+        path: "{{ mysql_conf_dir }}/mysqld.cnf"
+        regexp: '^bind-address\s*='
+        line: "bind-address = 0.0.0.0"
+      notify: Restart mysql
+      tags: [os, config]
+
+    - name: Configuracion de Group Replication
+      ansible.builtin.template:
+        src: gr.cnf.j2
+        dest: "{{ mysql_conf_dir }}/gr.cnf"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart mysql
+      tags: [os, config]
+
+    - name: Aplicar cambios ahora
+      ansible.builtin.meta: flush_handlers
+      tags: os
+
+    - name: MySQL arriba y habilitado
+      ansible.builtin.service:
+        name: mysql
+        state: started
+        enabled: true
+      tags: os
+
+  handlers:
+    - name: Restart mysql
+      ansible.builtin.service:
+        name: mysql
+        state: restarted
+
+- name: Usuario y canal de recuperacion (en cada nodo, sin binlog)
+  hosts: mysql
+  become: true
+  gather_facts: false
+  tags: db
+  module_defaults:
+    group/ansible.mysql.all:
+      login_unix_socket: "{{ mysql_socket }}"
+      login_user: root
+
+  tasks:
+    - name: Estado de este nodo en el grupo
+      ansible.mysql.mysql_query:
+        query: >-
+          SELECT IFNULL((SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+                          WHERE MEMBER_ID = @@server_uuid), 'OFFLINE') AS s
+      register: gr_estado
+      changed_when: false
+
+    # ERROR: p.ej. se apagaron los 4 y al prender cada uno busco el grupo y no lo
+    # encontro. En ERROR el nodo queda en solo lectura y con el plugin a medias.
+    - name: Salir del estado ERROR
+      ansible.mysql.mysql_query:
+        query: STOP GROUP_REPLICATION
+      when: gr_estado.query_result[0][0].s == 'ERROR'
+
+    - name: Guardar estado
+      ansible.builtin.set_fact:
+        estado_gr: "{{ 'OFFLINE' if gr_estado.query_result[0][0].s == 'ERROR' else gr_estado.query_result[0][0].s }}"
+
+    - name: Usuario y canal de recuperacion
+      block:
+        # Fuera del grupo el nodo puede estar en solo lectura (super_read_only): se abre
+        # solo para estos cambios locales y se vuelve a cerrar abajo, pase lo que pase.
+        - name: Permitir cambios locales mientras se configura
+          ansible.mysql.mysql_query:
+            query: SET GLOBAL super_read_only = OFF
+          when: estado_gr not in ['ONLINE', 'RECOVERING']
+          changed_when: false
+
+        # sql_log_bin = 0: el usuario es local de cada nodo. Si fuera al binlog crearia
+        # transacciones que el grupo no tiene y el nodo no podria unirse.
+        - name: Usuario 'rpl' para que los demas nodos se recuperen desde este
+          ansible.mysql.mysql_query:
+            session_vars:
+              sql_log_bin: 0
+            query:
+              - CREATE USER IF NOT EXISTS 'rpl'@%(h)s IDENTIFIED BY %(pw)s
+              - ALTER USER 'rpl'@%(h)s IDENTIFIED BY %(pw)s
+              - GRANT REPLICATION SLAVE ON *.* TO 'rpl'@%(h)s
+            named_args:
+              h: "{{ item }}"
+              pw: "{{ repl_password }}"
+          loop: "{{ rpl_client_hosts }}"
+          no_log: true
+
+        - name: Canal de recuperacion (credenciales para ponerse al dia al unirse)
+          ansible.mysql.mysql_query:
+            query: >-
+              CHANGE REPLICATION SOURCE TO SOURCE_USER = 'rpl', SOURCE_PASSWORD = %(pw)s
+              FOR CHANNEL 'group_replication_recovery'
+            named_args:
+              pw: "{{ repl_password }}"
+          when: estado_gr not in ['ONLINE', 'RECOVERING']
+          no_log: true
+      always:
+        # Fuera del grupo, solo lectura: nadie debe escribir aqui hasta que se una
+        # (START GROUP_REPLICATION la quita sola cuando el nodo queda ONLINE).
+        - name: Volver a solo lectura mientras no este en el grupo
+          ansible.mysql.mysql_query:
+            query: SET GLOBAL super_read_only = ON
+          when: estado_gr not in ['ONLINE', 'RECOVERING']
+          changed_when: false
+
+- name: Formar el grupo (un nodo a la vez)
+  hosts: mysql
+  become: true
+  gather_facts: false
+  tags: db
+  serial: 1
+  order: sorted
+  module_defaults:
+    group/ansible.mysql.all:
+      login_unix_socket: "{{ mysql_socket }}"
+      login_user: root
+  vars:
+    # Hay grupo si al empezar ALGUN nodo estaba ONLINE (si no, este deploy lo crea).
+    grupo_activo: "{{ gr_hosts | map('extract', hostvars, 'estado_gr') | select('equalto', 'ONLINE') | list | length > 0 }}"
+    estado_sql: >-
+      SELECT IFNULL((SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+                      WHERE MEMBER_ID = @@server_uuid), 'OFFLINE') AS s
+
+  tasks:
+    - name: Estado actual
+      ansible.mysql.mysql_query:
+        query: "{{ estado_sql }}"
+      register: ahora
+      changed_when: false
+
+    # ERROR: p.ej. arranco con start_on_boot y no encontro grupo (se apagaron todos).
+    - name: Salir del estado ERROR
+      ansible.mysql.mysql_query:
+        query: STOP GROUP_REPLICATION
+      when: ahora.query_result[0][0].s == 'ERROR'
+
+    - name: Crear o unirse al grupo
+      when: ahora.query_result[0][0].s not in ['ONLINE', 'RECOVERING']
+      block:
+        - name: Crear el grupo (bootstrap, solo si no hay ninguno corriendo)
+          ansible.mysql.mysql_query:
+            query:
+              - SET GLOBAL group_replication_bootstrap_group = ON
+              - START GROUP_REPLICATION
+          when: inventory_hostname == bootstrap_host and not (grupo_activo | bool)
+
+        - name: Unirse al grupo existente
+          ansible.mysql.mysql_query:
+            query: START GROUP_REPLICATION
+          when: not (inventory_hostname == bootstrap_host and not (grupo_activo | bool))
+      always:
+        # NUNCA dejar bootstrap encendido: un reinicio crearia un SEGUNDO grupo aparte.
+        - name: Apagar bootstrap
+          ansible.mysql.mysql_query:
+            query: SET GLOBAL group_replication_bootstrap_group = OFF
+          changed_when: false
+
+    - name: Esperar a que el nodo este ONLINE (se pone al dia con los demas)
+      ansible.mysql.mysql_query:
+        query: "{{ estado_sql }}"
+      register: listo
+      until: listo.query_result[0][0].s == 'ONLINE'
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: Volver solo al grupo si el servidor se reinicia
+      ansible.mysql.mysql_query:
+        query: SET PERSIST group_replication_start_on_boot = ON
+      changed_when: false
+
+- name: Datos de demo y estado final
+  hosts: mysql
+  become: true
+  gather_facts: false
+  tags: db
+  module_defaults:
+    group/ansible.mysql.all:
+      login_unix_socket: "{{ mysql_socket }}"
+      login_user: root
+
+  tasks:
+    # Se escribe en UN nodo y el grupo lo lleva a los otros 3.
+    - name: Tabla clientes (Group Replication exige llave primaria)
+      ansible.mysql.mysql_query:
+        query:
+          - CREATE DATABASE IF NOT EXISTS {{ db_name }}
+          - >-
+            CREATE TABLE IF NOT EXISTS {{ db_name }}.clientes (
+              id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              email          VARCHAR(120)    NOT NULL,
+              nombre         VARCHAR(120)    NOT NULL,
+              saldo          DECIMAL(12,2)   NOT NULL DEFAULT 0,
+              nodo           VARCHAR(32)     NULL,
+              actualizado_en TIMESTAMP(6)    NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+              UNIQUE KEY uq_email (email)
+            )
+      when: inventory_hostname == bootstrap_host
+
+    - name: Cargar clientes de demo (solo si la tabla esta vacia)
+      ansible.mysql.mysql_query:
+        session_vars:
+          cte_max_recursion_depth: 10000000   # default 1000: con demo_filas > 1000 fallaria
+        query: >-
+          INSERT INTO {{ db_name }}.clientes (email, nombre, saldo, nodo)
+          SELECT CONCAT('cliente', n, '@demo.com'), CONCAT('Cliente ', n), n * 10, '{{ inventory_hostname }}'
+            FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < {{ demo_filas | int }})
+                  SELECT n FROM s) t
+           WHERE NOT EXISTS (SELECT 1 FROM {{ db_name }}.clientes)
+      when: inventory_hostname == bootstrap_host
+
+    - name: Miembros del grupo
+      ansible.mysql.mysql_query:
+        query: >-
+          SELECT MEMBER_HOST AS host, MEMBER_STATE AS estado, MEMBER_ROLE AS rol
+            FROM performance_schema.replication_group_members ORDER BY MEMBER_HOST
+      register: miembros
+      changed_when: false
+      when: inventory_hostname == bootstrap_host
+
+    - name: Los {{ gr_hosts | length }} nodos deben estar ONLINE y como PRIMARY
+      ansible.builtin.assert:
+        that:
+          - miembros.query_result[0] | selectattr('estado', 'equalto', 'ONLINE') | list | length == gr_hosts | length
+          - miembros.query_result[0] | selectattr('rol', 'equalto', 'PRIMARY') | list | length == gr_hosts | length
+        fail_msg: >-
+          El grupo no quedo completo:
+          {% for m in miembros.query_result[0] %}{{ m.host }}={{ m.estado }}/{{ m.rol }} {% endfor %}
+        success_msg: >-
+          Grupo completo:
+          {% for m in miembros.query_result[0] %}{{ m.host }}={{ m.estado }}/{{ m.rol }} {% endfor %}
+      when: inventory_hostname == bootstrap_host

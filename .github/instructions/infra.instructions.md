@@ -41,6 +41,15 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
   Gotchas probados: comparar JSON vía variable local tipada (no `@var`), TIMESTAMP en UTC,
   JSON_VALUE corta a 512 chars (se usa JSON_EXTRACT).
 
+- `environments/mysql-gr/` + `ansible/mysql-gr/`: Group Replication multi-primary, 4 EC2
+  (una por AZ si alcanzan; `element()` da la vuelta), SG con 3306 y 33061 solo entre nodos.
+  `templates/gr.cnf.j2` (message_cache 128 MB por la t3.micro, auto_increment 4/offset N).
+  Playbook: usuario `rpl` local con sql_log_bin=0, bootstrap SOLO en node_a si no hay grupo
+  ONLINE, los demás se unen `serial: 1`, `SET PERSIST start_on_boot=ON` al quedar ONLINE.
+  Gotchas probados: tras un apagón total los nodos quedan en super_read_only (se abre solo
+  para crear el usuario y se cierra en `always`); XCom abre el puerto en TODAS las IPs (por
+  eso las semillas usan el `gr_port` de cada host); nunca dejar bootstrap_group=ON.
+
 ## Stack (modules/stack) — puntos clave
 - DynamoDB main (PK/SK, 4 GSIs, Streams NEW_AND_OLD_IMAGES, PITR en prod) + WSConnections.
 - Cognito (email username, `custom:areaId`, grupos Requester/Agent/Manager/Admin,

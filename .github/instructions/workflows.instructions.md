@@ -35,6 +35,8 @@ Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Variable: `AWS_REGION`.
 - `mysql-replica-deploy.yml` / `mysql-replica-destroy.yml` / `mysql-replica-rescate.yml`:
   stack `mysql-replica`, `concurrency: mysql-replica`, mismos secrets/vars que mysql-*.
   rescate: modo diagnostico|rescatar (confirm `rescatar`), bloquear si|no; no crea EC2.
+- `mysql-gr-deploy.yml` / `mysql-gr-destroy.yml`: stack `mysql-gr` (4 EC2),
+  `concurrency: mysql-gr`, mismos secrets/vars que mysql-*. Re-correr apply recupera el grupo.
 
 ## Reglas
 - Mantener deploy MANUAL; no agregar trigger `push`/auto salvo petición.

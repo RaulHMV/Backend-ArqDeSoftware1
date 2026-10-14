@@ -1,0 +1,29 @@
+# Generado por Ansible. MySQL Group Replication multi-primary: {{ gr_hosts | length }} maestros.
+[mysqld]
+server_id = {{ node_index | int + 1 }}
+# Direccion con la que los demas nodos encuentran a este (recuperacion).
+report_host = {{ private_ip }}
+gtid_mode = ON
+enforce_gtid_consistency = ON
+binlog_format = ROW
+# Group Replication solo funciona con InnoDB: los demas motores quedan prohibidos.
+disabled_storage_engines = "MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
+# IDs: cada nodo genera su propia serie y nunca chocan (incremento = numero de nodos).
+auto_increment_increment = {{ gr_hosts | length }}
+auto_increment_offset = {{ node_index | int + 1 }}
+
+plugin_load_add = group_replication.so
+group_replication_group_name = {{ gr_group_name }}
+group_replication_local_address = {{ private_ip }}:{{ gr_port }}
+group_replication_group_seeds = {{ gr_seeds }}
+group_replication_ip_allowlist = {{ gr_allowlist }}
+# Multi-primary: TODOS aceptan escrituras; el grupo detecta los conflictos.
+group_replication_single_primary_mode = OFF
+group_replication_enforce_update_everywhere_checks = ON
+# El arranque lo controla Ansible (bootstrap del primer nodo). Al unirse, cada nodo
+# activa start_on_boot con SET PERSIST para volver solo al grupo si se reinicia.
+group_replication_start_on_boot = OFF
+group_replication_bootstrap_group = OFF
+group_replication_recovery_use_ssl = ON
+# Default 1 GB: demasiado para una t3.micro (1 GB de RAM). 128 MB es el minimo.
+group_replication_message_cache_size = 134217728

@@ -1,0 +1,30 @@
+---
+db_name: demo
+mysql_conf_dir: /etc/mysql/mysql.conf.d
+mysql_socket: /var/run/mysqld/mysqld.sock
+
+# --- Group Replication ---
+gr_port: 33061
+# "Nombre" del grupo: un UUID igual en los 4 nodos. Determinista (no cambia entre deploys).
+gr_group_name: "{{ 'ticketsys-mysql-gr' | to_uuid }}"
+gr_hosts: "{{ groups['mysql'] | sort }}"
+gr_ips: "{{ gr_hosts | map('extract', hostvars, 'private_ip') | list }}"
+# IP:puerto de cada nodo. En AWS todos usan 33061 (una EC2 por nodo); se toma el de
+# cada host para poder probar varios nodos en una sola maquina (puerto distinto cada uno).
+gr_seeds: "{% for h in gr_hosts %}{{ hostvars[h].private_ip }}:{{ hostvars[h].gr_port }}{{ ',' if not loop.last }}{% endfor %}"
+# Quien puede hablar el protocolo del grupo: solo los nodos (el SG tambien lo limita).
+gr_allowlist: "{{ gr_ips | join(',') }}"
+# Desde donde se conecta un nodo que se recupera (usuario 'rpl' en los demas).
+rpl_client_hosts: "{{ gr_ips }}"
+# Nodo que crea el grupo cuando no hay ninguno corriendo (node_index 0).
+bootstrap_host: "{{ gr_hosts | map('extract', hostvars) | selectattr('node_index', 'equalto', 0) | map(attribute='inventory_hostname') | first }}"
+
+# Filas de demo que se cargan al crear el grupo.
+demo_filas: 1000
+
+# Tu llave publica para entrar por SSH a mano (variable SSH_PUBLIC_KEY de GitHub).
+extra_ssh_key: "{{ lookup('env', 'SSH_PUBLIC_KEY') }}"
+
+# Password del usuario de recuperacion: el workflow le pasa el MISMO secret
+# POSTGRES_PASSWORD que usan los otros stacks. Nunca va en el repo.
+repl_password: "{{ lookup('env', 'MYSQL_PASSWORD') }}"

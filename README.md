@@ -104,6 +104,28 @@ Usa el mismo `POSTGRES_PASSWORD` y `SSH_PUBLIC_KEY` que los otros stacks.
 
 ---
 
+## MySQL Group Replication: 4 maestros (stack aparte)
+
+4 EC2 con MySQL 8.0 en **Group Replication multi-primary**: los 4 aceptan escrituras y,
+antes de confirmar cada transacción, el grupo revisa si otro nodo tocó las mismas filas.
+Si sí, el segundo `COMMIT` falla (la app reintenta) y **los datos nunca divergen**.
+
+1. Actions → **mysql-gr-deploy** (`plan`, luego `apply` + `deploy`). Mismo `POSTGRES_PASSWORD`
+   y `SSH_PUBLIC_KEY` de siempre.
+2. Entra a cualquier nodo: `ssh ubuntu@<IP>` y `sudo mysql demo`. IDs: el maestro N genera
+   números con `id mod 4 = N` (incremento 4).
+3. Para ver el grupo: `SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members;`
+4. **mysql-gr-destroy** al terminar (son 4 EC2 facturando).
+
+Límites a saber:
+- Funciona con **mayoría** (3 de 4): aguanta 1 nodo caído; si la red se parte 2 y 2 se
+  bloquean las escrituras (por eso MySQL recomienda 3 o 5 nodos).
+- Todas las tablas necesitan PK, solo InnoDB, sin FKs con `CASCADE`.
+- Si se apagan los 4, volver a correr `mysql-gr-deploy` (`apply`) reconstruye el grupo
+  desde `node_a`.
+
+---
+
 ## Desarrollo local del backend
 
 ```bash
