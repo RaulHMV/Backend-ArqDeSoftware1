@@ -19,6 +19,9 @@ rpl_client_hosts: "{{ gr_ips }}"
 # Nodo que crea el grupo cuando no hay ninguno corriendo (node_index 0).
 bootstrap_host: "{{ gr_hosts | map('extract', hostvars) | selectattr('node_index', 'equalto', 0) | map(attribute='inventory_hostname') | first }}"
 
+# Swap por nodo (la t3.micro tiene ~1 GB de RAM; el disco es de 20 GB).
+swap_mb: 2048
+
 # Filas de demo que se cargan al crear el grupo.
 demo_filas: 1000
 

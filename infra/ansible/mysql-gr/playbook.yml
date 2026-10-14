@@ -47,6 +47,45 @@
       when: extra_ssh_key | length > 0
       tags: os
 
+    # La t3.micro tiene ~1 GB de RAM y sin swap el sistema MATA a MySQL cuando se le
+    # acaba la memoria (OOM killer: paso en AWS con los 4 nodos). Con swap usa el disco
+    # como respaldo y MySQL sigue vivo.
+    - name: Ver si ya hay swap
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swap_actual
+      changed_when: false
+      tags: os
+
+    - name: Crear swap de {{ swap_mb }} MB en /swapfile
+      ansible.builtin.shell: |
+        set -e
+        fallocate -l {{ swap_mb }}M /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+      when: "'/swapfile' not in swap_actual.stdout"
+      tags: os
+
+    - name: Swap permanente (sobrevive reinicios)
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+      tags: os
+
+    # 10 = usar swap solo cuando de verdad falte RAM (no mandar MySQL a disco sin razon).
+    - name: Swap solo como respaldo (swappiness 10)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-swap.conf
+        content: "vm.swappiness = 10\n"
+        mode: "0644"
+      register: swappiness
+      tags: os
+
+    - name: Aplicar swappiness
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/90-swap.conf
+      when: swappiness.changed
+      tags: os
+
     - name: Instalar MySQL 8.0 y dependencias
       ansible.builtin.apt:
         name:
