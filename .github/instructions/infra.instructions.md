@@ -50,6 +50,16 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
   para crear el usuario y se cierra en `always`); XCom abre el puerto en TODAS las IPs (por
   eso las semillas usan el `gr_port` de cada host); nunca dejar bootstrap_group=ON.
 
+- `environments/pg-mesh/` + `ansible/pg-mesh/`: Postgres 16, 4 maestros en malla completa de
+  replicación lógica (cada nodo publica `mensajes` y se suscribe a los otros 3: 12
+  suscripciones, `origin = none`, `copy_data = false`). 4 EC2 como mysql-gr (`element()`),
+  SG solo con 5432 entre nodos, swap 2 GB. Secuencia por nodo START index+1 INCREMENT 4.
+  `CREATE SUBSCRIPTION` con `throttle: 1` (en paralelo hay deadlock distribuido al crear slots).
+  Play final: cada nodo inserta su saludo y se espera que los 4 vean los 4.
+  Probado en local con 4 Postgres 16.15 (`pg_port` y `pg_socket_dir` por host para correr
+  varios en una máquina). Límite probado: dos nodos editando la MISMA fila a la vez divergen
+  (PG16 no detecta conflictos; a diferencia de Group Replication).
+
 ## Stack (modules/stack) — puntos clave
 - DynamoDB main (PK/SK, 4 GSIs, Streams NEW_AND_OLD_IMAGES, PITR en prod) + WSConnections.
 - Cognito (email username, `custom:areaId`, grupos Requester/Agent/Manager/Admin,

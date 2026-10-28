@@ -21,6 +21,7 @@ ticket-system/
   infra/ansible/mysql + infra/environments/mysql-multimaster: MySQL maestro-maestro en 2 EC2 (aparte)
   infra/ansible/mysql-replica + infra/environments/mysql-replica: MySQL maestro-esclavo MAL hecho + rescate desde binlog (aparte)
   infra/ansible/mysql-gr + infra/environments/mysql-gr: MySQL Group Replication, 4 maestros (aparte)
+  infra/ansible/pg-mesh + infra/environments/pg-mesh: Postgres en malla, 4 maestros (aparte)
 ```
 
 ## Datos AWS

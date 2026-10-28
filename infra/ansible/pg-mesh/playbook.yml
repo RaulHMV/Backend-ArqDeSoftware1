@@ -1,0 +1,312 @@
+---
+# PostgreSQL 16: 4 maestros iguales con replicacion logica en MALLA COMPLETA.
+# Cada nodo publica su tabla y se suscribe directo a los otros 3 (12 suscripciones).
+# origin = none: un nodo solo reenvia lo que se escribio en EL, nunca lo que le
+# llego de otro; asi un cambio de node_a llega una vez a b, c y d y no rebota.
+# Secret requerido en el entorno: POSTGRES_PASSWORD (lo inyecta el workflow).
+#
+# Play 1: instala y configura Postgres, crea DB/tabla/publicacion en cada nodo.
+# Play 2: suscripciones cruzadas (van aparte para que las 4 publicaciones existan antes).
+# Play 3: cada nodo escribe un mensaje y se verifica que los 4 ven los 4.
+#
+# Tags: "os" = sistema operativo (apt, swap, archivos de config, servicio);
+#       "db" = todo lo que se hace dentro de Postgres.
+
+- name: Preparar nodos y publicaciones
+  hosts: pg
+  become: true
+  gather_facts: false
+  module_defaults:
+    group/community.postgresql.all:
+      login_unix_socket: "{{ pg_socket_dir }}"
+      login_port: "{{ pg_port }}"
+
+  pre_tasks:
+    - name: Esperar SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    # cloud-init todavia puede tener el lock de dpkg en el primer boot
+    - name: Esperar a que cloud-init termine
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      failed_when: cloud_init.rc not in [0, 2]
+      tags: os
+
+  tasks:
+    - name: Validar que llego el password
+      ansible.builtin.assert:
+        that: db_password | length > 0
+        fail_msg: "Falta POSTGRES_PASSWORD en el entorno"
+      no_log: true
+      tags: db
+
+    - name: Validar formato de SSH_PUBLIC_KEY (si se dio)
+      ansible.builtin.assert:
+        that: extra_ssh_key is match('^ssh-(ed25519|rsa) ')
+        fail_msg: "SSH_PUBLIC_KEY debe ser una llave publica (ssh-ed25519 ... o ssh-rsa ...)"
+      when: extra_ssh_key | length > 0
+      tags: os
+
+    - name: Autorizar tu llave SSH para el usuario ubuntu
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        line: "{{ extra_ssh_key }}"
+      when: extra_ssh_key | length > 0
+      tags: os
+
+    # La t3.micro tiene ~1 GB de RAM y cada nodo corre 3 walsenders + 3 workers de
+    # replicacion. Sin swap el OOM killer puede matar a Postgres (paso con MySQL).
+    - name: Ver si ya hay swap
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swap_actual
+      changed_when: false
+      tags: os
+
+    - name: Crear swap de {{ swap_mb }} MB en /swapfile
+      ansible.builtin.shell: |
+        set -e
+        fallocate -l {{ swap_mb }}M /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+      when: "'/swapfile' not in swap_actual.stdout"
+      tags: os
+
+    - name: Swap permanente (sobrevive reinicios)
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+      tags: os
+
+    # 10 = usar swap solo cuando de verdad falte RAM.
+    - name: Swap solo como respaldo (swappiness 10)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-swap.conf
+        content: "vm.swappiness = 10\n"
+        mode: "0644"
+      register: swappiness
+      tags: os
+
+    - name: Aplicar swappiness
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/90-swap.conf
+      when: swappiness.changed
+      tags: os
+
+    # lock_timeout alto: en el primer boot unattended-upgrades puede tener
+    # el lock de dpkg varios minutos (el default de 60 s no alcanza).
+    - name: Instalar PostgreSQL 16 y dependencias
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - python3-psycopg2
+          - acl
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 600
+      tags: os
+
+    # Por nodo: 3 slots + 3 walsenders (los otros 3 leen de el) y 3 apply workers
+    # (el lee de los otros 3). Los defaults alcanzan justo; se deja holgura.
+    - name: Configuracion de replicacion logica
+      ansible.builtin.copy:
+        dest: "{{ pg_conf_dir }}/conf.d/mesh.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+        content: |
+          wal_level = logical
+          listen_addresses = '*'
+          max_replication_slots = 10
+          max_wal_senders = 10
+          max_logical_replication_workers = 8
+          max_worker_processes = 16
+      notify: Restart postgresql
+      tags: os
+
+    - name: Permitir solo a los otros nodos (IP privada) para replicar
+      ansible.builtin.blockinfile:
+        path: "{{ pg_conf_dir }}/pg_hba.conf"
+        marker: "# {mark} ANSIBLE mesh"
+        block: |
+          {% for p in peers %}
+          host {{ db_name }} replicator {{ hostvars[p].private_ip }}/32 scram-sha-256
+          {% endfor %}
+      notify: Restart postgresql
+      tags: os
+
+    # wal_level, listen_addresses y los max_* solo toman efecto con restart
+    - name: Aplicar cambios ahora
+      ansible.builtin.meta: flush_handlers
+      tags: os
+
+    - name: Postgres arriba y habilitado
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+      tags: os
+
+    - name: Password del usuario postgres
+      community.postgresql.postgresql_user:
+        name: postgres
+        password: "{{ db_password }}"
+      become_user: postgres
+      no_log: true
+      tags: db
+
+    - name: Usuario de replicacion
+      community.postgresql.postgresql_user:
+        name: replicator
+        password: "{{ db_password }}"
+        role_attr_flags: LOGIN,REPLICATION
+      become_user: postgres
+      no_log: true
+      tags: db
+
+    - name: Base de datos {{ db_name }}
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+      become_user: postgres
+      tags: db
+
+    # Secuencia por nodo con incremento 4: node_a 1,5,9..  node_b 2,6,10..
+    # node_c 3,7,11..  node_d 4,8,12..  Asi los IDs nunca chocan entre nodos.
+    - name: Tabla mensajes con secuencia por nodo
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: |
+          CREATE SEQUENCE IF NOT EXISTS mensajes_id_seq START {{ node_index | int + 1 }} INCREMENT {{ mesh_hosts | length }};
+          CREATE TABLE IF NOT EXISTS mensajes (
+            id bigint PRIMARY KEY DEFAULT nextval('mensajes_id_seq'),
+            nodo text NOT NULL DEFAULT '{{ inventory_hostname }}',
+            contenido text NOT NULL,
+            creado_en timestamptz NOT NULL DEFAULT now()
+          );
+          ALTER TABLE mensajes ALTER COLUMN id SET DEFAULT nextval('mensajes_id_seq');
+          ALTER SEQUENCE mensajes_id_seq OWNED BY mensajes.id;
+          GRANT SELECT ON mensajes TO replicator;
+      become_user: postgres
+      tags: db
+
+    - name: Publicacion de este nodo
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: |
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'pub_{{ inventory_hostname }}') THEN
+              CREATE PUBLICATION pub_{{ inventory_hostname }} FOR TABLE mensajes;
+            END IF;
+          END
+          $$;
+      become_user: postgres
+      tags: db
+
+  handlers:
+    - name: Restart postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+- name: Suscripciones en malla (cada nodo a los otros 3)
+  hosts: pg
+  become: true
+  gather_facts: false
+  tags: db
+  module_defaults:
+    group/community.postgresql.all:
+      login_unix_socket: "{{ pg_socket_dir }}"
+      login_port: "{{ pg_port }}"
+
+  tasks:
+    - name: Suscripciones que ya existen
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: SELECT subname FROM pg_subscription
+      become_user: postgres
+      register: subs_actuales
+      changed_when: false
+
+    # CREATE SUBSCRIPTION no puede correr dentro de una transaccion -> autocommit.
+    # copy_data = false: las tablas nacen vacias en todos los nodos.
+    # throttle: 1 -> las 12 se crean UNA a la vez. En paralelo hay deadlock distribuido:
+    # cada CREATE SUBSCRIPTION deja su transaccion abierta mientras crea el slot en el
+    # otro nodo, y crear un slot espera a que terminen las transacciones abiertas.
+    - name: Suscribirse a la publicacion de cada uno de los otros nodos
+      throttle: 1
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        autocommit: true
+        query: >-
+          CREATE SUBSCRIPTION sub_{{ inventory_hostname }}_from_{{ item }}
+          CONNECTION 'host={{ hostvars[item].private_ip }} port={{ hostvars[item].pg_port }} dbname={{ db_name }} user=replicator password={{ db_password }}'
+          PUBLICATION pub_{{ item }}
+          WITH (origin = none, copy_data = false)
+      become_user: postgres
+      loop: "{{ peers }}"
+      when: ('sub_' ~ inventory_hostname ~ '_from_' ~ item) not in (subs_actuales.query_result | map(attribute='subname') | list)
+      no_log: true
+
+    # Recibe: un apply worker corriendo por cada suscripcion (puede haber workers
+    # extra de sync/parallel apply, por eso se cuentan suscripciones distintas).
+    - name: Este nodo recibe de los otros {{ peers | length }}
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: >-
+          SELECT count(DISTINCT subname) AS n FROM pg_stat_subscription
+           WHERE pid IS NOT NULL AND subname LIKE 'sub\_{{ inventory_hostname }}\_from\_%'
+      become_user: postgres
+      register: recibe
+      until: recibe.query_result[0].n | int == peers | length
+      retries: 15
+      delay: 4
+      changed_when: false
+
+    # Envia: los otros 3 tienen su slot en este nodo y estan conectados a el.
+    - name: Este nodo envia a los otros {{ peers | length }}
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: >-
+          SELECT count(*) AS n FROM pg_replication_slots
+           WHERE active AND slot_name LIKE 'sub\_%\_from\_{{ inventory_hostname }}'
+      become_user: postgres
+      register: envia
+      until: envia.query_result[0].n | int == peers | length
+      retries: 15
+      delay: 4
+      changed_when: false
+
+- name: Prueba de punta a punta
+  hosts: pg
+  become: true
+  gather_facts: false
+  tags: db
+  module_defaults:
+    group/community.postgresql.all:
+      login_unix_socket: "{{ pg_socket_dir }}"
+      login_port: "{{ pg_port }}"
+
+  tasks:
+    # Solo la primera vez: si ya hay un mensaje de este nodo no se repite.
+    - name: Cada nodo escribe su saludo en SU base
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: >-
+          INSERT INTO mensajes (contenido)
+          SELECT 'hola desde {{ inventory_hostname }}'
+           WHERE NOT EXISTS (SELECT 1 FROM mensajes WHERE nodo = '{{ inventory_hostname }}')
+      become_user: postgres
+
+    - name: Los {{ mesh_hosts | length }} nodos ven los mensajes de los {{ mesh_hosts | length }}
+      community.postgresql.postgresql_query:
+        login_db: "{{ db_name }}"
+        query: SELECT count(DISTINCT nodo) AS n FROM mensajes
+      become_user: postgres
+      register: vistos
+      until: vistos.query_result[0].n | int == mesh_hosts | length
+      retries: 15
+      delay: 2
+      changed_when: false

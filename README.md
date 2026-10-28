@@ -126,6 +126,31 @@ Límites a saber:
 
 ---
 
+## PostgreSQL en malla: 4 maestros (stack aparte)
+
+4 EC2 con PostgreSQL 16, todos maestros. Es la misma replicación lógica nativa del stack de
+2 nodos, pero en **malla completa**: cada nodo publica su tabla y se suscribe directo a los
+otros 3 (12 suscripciones). Con `origin = none` cada cambio llega una sola vez a los demás y
+no rebota.
+
+1. Actions → **pg-mesh-deploy** (`plan`, luego `apply` + `deploy`). Mismo `POSTGRES_PASSWORD`
+   y `SSH_PUBLIC_KEY` de siempre.
+2. Entra a cualquier nodo: `ssh ubuntu@<IP>` y `sudo -u postgres psql demo`. Ya hay un
+   `hola desde node_x` de cada nodo en `mensajes` (el deploy lo usa como prueba). IDs:
+   `node_a` 1, 5, 9…, `node_b` 2, 6, 10…, `node_c` 3, 7, 11…, `node_d` 4, 8, 12…
+3. Para ver la malla: `\dRs` (3 suscripciones) y `SELECT slot_name, active FROM pg_replication_slots;`
+   (3 slots: los otros nodos leyendo de este).
+4. **pg-mesh-destroy** al terminar (son 4 EC2 facturando).
+
+Límites a saber:
+- **No hay detección de conflictos**: si dos nodos editan la MISMA fila al mismo tiempo, cada
+  uno se queda con la versión del otro y divergen. Los INSERT no chocan gracias a las secuencias.
+- Si un nodo se cae los otros 3 siguen, y al volver se pone al día solo (los demás le guardan
+  el WAL mientras tanto).
+- El DDL (`CREATE`/`ALTER TABLE`) no se replica: hay que aplicarlo en los 4 nodos.
+
+---
+
 ## Desarrollo local del backend
 
 ```bash

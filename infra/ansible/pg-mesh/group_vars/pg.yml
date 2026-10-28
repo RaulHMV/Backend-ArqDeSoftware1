@@ -1,0 +1,21 @@
+---
+db_name: demo
+pg_conf_dir: /etc/postgresql/16/main
+pg_socket_dir: /var/run/postgresql
+# En AWS todos usan 5432 (una EC2 por nodo); se toma el de cada host para poder
+# probar los 4 nodos en una sola maquina (puerto distinto cada uno).
+pg_port: 5432
+
+# Malla completa: cada nodo se suscribe DIRECTO a cada uno de los otros 3.
+mesh_hosts: "{{ groups['pg'] | sort }}"
+peers: "{{ mesh_hosts | difference([inventory_hostname]) }}"
+
+# Swap por nodo (la t3.micro tiene ~1 GB de RAM; el disco es de 20 GB).
+swap_mb: 2048
+
+# Tu llave publica para entrar por SSH a mano (variable SSH_PUBLIC_KEY de GitHub).
+# Opcional: si esta vacia solo entra la llave que genera Terraform (la del runner).
+extra_ssh_key: "{{ lookup('env', 'SSH_PUBLIC_KEY') }}"
+
+# Viene del secret POSTGRES_PASSWORD de GitHub (nunca va en el repo).
+db_password: "{{ lookup('env', 'POSTGRES_PASSWORD') }}"

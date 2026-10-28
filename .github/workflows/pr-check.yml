@@ -72,3 +72,9 @@ jobs:
           terraform init -backend=false -input=false
           terraform validate
         working-directory: infra/environments/mysql-gr
+
+      - name: Validate pg-mesh
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+        working-directory: infra/environments/pg-mesh
