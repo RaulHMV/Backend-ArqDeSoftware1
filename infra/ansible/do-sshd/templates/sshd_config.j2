@@ -31,6 +31,9 @@ AllowUsers {{ admin_user }}
 AuthenticationMethods publickey,keyboard-interactive
 PubkeyAuthentication yes
 KbdInteractiveAuthentication yes
+# Nombre viejo de KbdInteractiveAuthentication (misma opcion): tambien en yes, porque
+# por ahi llega el codigo TOTP. En "no" nadie podria entrar.
+ChallengeResponseAuthentication yes
 UsePAM yes
 AuthorizedKeysFile .ssh/authorized_keys
 StrictModes yes
@@ -52,6 +55,8 @@ MaxStartups 10:30:60
 MaxSessions 4
 ClientAliveInterval 300
 ClientAliveCountMax 2
+# Cierra la sesion si el canal pasa 15 min sin ningun trafico (OpenSSH 9.2+).
+ChannelTimeout session=15m
 TCPKeepAlive no
 
 # ---------------------------------------------------------------- Lo que no se usa: apagado
