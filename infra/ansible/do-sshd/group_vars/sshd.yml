@@ -36,6 +36,9 @@ ansible_sshpass_prompt: "Verification code:"
 # una huella vieja guardada OpenSSH desactiva keyboard-interactive (el codigo TOTP).
 ansible_ssh_common_args: "-o UserKnownHostsFile=/dev/null"
 ansible_become_password: "{{ admin_password }}"
+# Python del sistema en Rocky 9 (3.9). Fijo: sin descubrirlo, que cuesta una conexion
+# mas (y con TOTP, cada conexion nueva necesita su propio codigo).
+ansible_python_interpreter: /usr/bin/python3
 
 banner_text: |
   ****************************************************************************

@@ -400,14 +400,20 @@ jobs:
             || bien "solo la llave no basta: pide el codigo de Google Authenticator"
           grep -q "NO CONTINUES SI NO TIENES PERMISOS" <<< "$salida" && bien "se muestra el banner" || mal "no aparece el banner"
 
-          # Codigo de una ventana de 30 s nueva (DISALLOW_REUSE rechaza uno ya usado).
+          # Login NUEVO con llave + codigo, pero UNO solo: conexion maestra propia (otra
+          # carpeta de control) que Ansible reusa. Sin reuso abriria varias conexiones y
+          # DISALLOW_REUSE rechazaria el mismo codigo en la segunda (paso en el run real).
+          # Codigo de una ventana de 30 s nueva: el del playbook ya no sirve.
           sleep $(( 31 - $(date +%s) % 30 ))
-          if CONNECT_AS=admin SSH_CONNECT_PORT="$SSH_PORT" \
-             ANSIBLE_SSH_ARGS="-o ControlMaster=no -o ControlPath=none" \
-             ansible sshd --playbook-dir . -b -m ansible.builtin.command -a "id -un" | grep -q '^root$'; then
+          salida=$(CONNECT_AS=admin SSH_CONNECT_PORT="$SSH_PORT" \
+                   ANSIBLE_SSH_ARGS="-o ControlMaster=auto -o ControlPersist=30s" \
+                   ANSIBLE_SSH_CONTROL_PATH_DIR="$(mktemp -d)" \
+                   ansible sshd --playbook-dir . -b -m ansible.builtin.command -a "id -un" 2>&1)
+          if grep -q '^root$' <<< "$salida"; then
             bien "llave + codigo TOTP entra, y sudo funciona con el password"
           else
             mal "no se pudo entrar con llave + codigo TOTP o sudo fallo"
+            echo "$salida"
           fi
           (( ok == 1 ))
 
