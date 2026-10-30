@@ -1,0 +1,41 @@
+---
+# Todo llega por variables de entorno desde el workflow (secrets e inputs).
+admin_user: "{{ lookup('env', 'ADMIN_USER') }}"
+admin_password: "{{ lookup('env', 'SUDO_PASSWORD') }}"
+admin_pubkey: "{{ lookup('file', lookup('env', 'SSH_PUBLIC_KEY_FILE')) }}"
+# Se acepta como lo muestra Google Authenticator / KeePass (con espacios o minusculas).
+totp_secret: "{{ lookup('env', 'TOTP_SECRET') | upper | replace(' ', '') | replace('=', '') }}"
+
+# Puerto de SSH: sin ningun 2 (nunca el 22). Debe coincidir con el firewall de DigitalOcean.
+ssh_port: "{{ lookup('env', 'SSH_PORT') | default('3947', true) | int }}"
+# En Rocky/RHEL el grupo de administradores (sudo) es wheel.
+sudo_group: wheel
+# En ~/.ssh y no en ~/: con SELinux (enforcing en Rocky) sshd solo puede reescribir el
+# archivo dentro de ~/.ssh (tipo ssh_home_t). PAM lo busca ahi con secret=.
+totp_file: "/home/{{ admin_user }}/.ssh/.google_authenticator"
+
+# --- Conexion ---
+# root: primera vez (droplet recien creado: DigitalOcean deja entrar a root con la llave
+#       por el 22). admin: ya endurecido; root no entra y hace falta llave + codigo TOTP
+#       por ssh_port. El codigo lo calcula files/totp.py en el runner, y el askpass de
+#       Ansible lo contesta cuando PAM pregunta "Verification code:".
+connect_as: "{{ lookup('env', 'CONNECT_AS') | default('root', true) }}"
+ansible_user: "{{ 'root' if connect_as == 'root' else admin_user }}"
+ansible_port: "{{ lookup('env', 'SSH_CONNECT_PORT') | default(ssh_port, true) }}"
+ansible_ssh_private_key_file: "{{ lookup('env', 'SSH_KEY_FILE') }}"
+ansible_password: "{{ '' if connect_as == 'root' else lookup('pipe', 'python3 ' ~ playbook_dir ~ '/files/totp.py') }}"
+ansible_sshpass_prompt: "Verification code:"
+# Sin known_hosts en el runner: la llave del servidor cambia (se regenera a RSA 4096) y con
+# una huella vieja guardada OpenSSH desactiva keyboard-interactive (el codigo TOTP).
+ansible_ssh_common_args: "-o UserKnownHostsFile=/dev/null"
+ansible_become_password: "{{ admin_password }}"
+
+banner_text: |
+  ****************************************************************************
+  *                          ACCESO RESTRINGIDO                              *
+  *                                                                          *
+  *   Este sistema es solo para personal AUTORIZADO.                         *
+  *   NO CONTINUES SI NO TIENES PERMISOS: desconectate ahora.                *
+  *                                                                          *
+  *   Todas las conexiones y acciones quedan registradas.                    *
+  ****************************************************************************

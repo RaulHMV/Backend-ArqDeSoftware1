@@ -22,6 +22,7 @@ ticket-system/
   infra/ansible/mysql-replica + infra/environments/mysql-replica: MySQL maestro-esclavo MAL hecho + rescate desde binlog (aparte)
   infra/ansible/mysql-gr + infra/environments/mysql-gr: MySQL Group Replication, 4 maestros (aparte)
   infra/ansible/pg-mesh + infra/environments/pg-mesh: Postgres en malla, 4 maestros (aparte)
+  infra/ansible/do-sshd + infra/environments/do-sshd: droplet DigitalOcean Rocky 9 con SSH+PAM endurecido (aparte)
 ```
 
 ## Datos AWS

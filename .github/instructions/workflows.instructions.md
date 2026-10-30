@@ -39,6 +39,11 @@ Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Variable: `AWS_REGION`.
   `concurrency: mysql-gr`, mismos secrets/vars que mysql-*. Re-correr apply recupera el grupo.
 - `pg-mesh-deploy.yml` / `pg-mesh-destroy.yml`: stack `pg-mesh` (4 EC2), `concurrency: pg-mesh`,
   mismos secrets/vars y versiones fijas de Ansible que pg-*. Inventario con `make_inventory.py ... pg`.
+- `sshd-deploy.yml` / `sshd-destroy.yml`: droplet DigitalOcean `SSHD-Conexion`, `concurrency: do-sshd`.
+  Secrets: `DIGITALOCEAN_TOKEN`, `SSH_PRIVATE_KEY` (OpenSSH o .ppk, RSA >= 4096), `SSH_KEY_PASSPHRASE`
+  (opcional), `SUDO_PASSWORD`, `TOTP_SECRET`. Inputs: mi_ip, usuario, puerto_ssh, region, size.
+  Sin state: tag -> Terraform crea o solo Ansible. La IP del runner se abre en el firewall (22 y
+  puerto) y se quita en un paso `always()`. destroy borra por nombre/tag con doctl.
 
 ## Reglas
 - Mantener deploy MANUAL; no agregar trigger `push`/auto salvo petición.

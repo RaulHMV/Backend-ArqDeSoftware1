@@ -1,0 +1,33 @@
+#%PAM-1.0
+# {{ ansible_managed }}
+# PAM de sshd endurecido (Rocky Linux 9). Fuente: infra/ansible/do-sshd.
+
+# ---- AUTH
+# sshd ya valido la llave publica (AuthenticationMethods publickey,keyboard-interactive):
+# aqui SOLO se pide el codigo de Google Authenticator.
+#  - Sin "password-auth": por SSH nunca se pide ni se acepta el password de Unix.
+#  - Sin "nullok": quien no tenga su archivo de Google Authenticator NO entra.
+#  - secret= en ~/.ssh: con SELinux, sshd solo puede reescribirlo ahi (ssh_home_t).
+auth       required     pam_google_authenticator.so secret=${HOME}/.ssh/.google_authenticator
+
+# ---- ACCOUNT
+account    required     pam_nologin.so
+# Solo {{ admin_user }} (ademas de AllowUsers en sshd_config).
+account    required     pam_access.so accessfile=/etc/security/access-sshd.conf
+account    include      password-auth
+
+# ---- SESSION
+# pam_selinux close/open: SELinux esta en enforcing; da el contexto correcto a la sesion.
+session    required     pam_selinux.so close
+session    required     pam_loginuid.so
+session    required     pam_selinux.so open env_params
+session    optional     pam_keyinit.so force revoke
+session    include      password-auth
+session    include      postlogin
+
+# ---- APAGADO: no se usa en este servidor
+#  - auth password-auth / postlogin: reemplazados por llave + codigo TOTP.
+#  - pam_sepermit: sin reglas en /etc/security/sepermit.conf.
+#  - pam_namespace: sin directorios polyinstanciados (namespace.conf vacio).
+#  - pam_motd: mensajes al entrar (PrintMotd no).
+#  - password password-auth: por SSH nunca se cambia el password.

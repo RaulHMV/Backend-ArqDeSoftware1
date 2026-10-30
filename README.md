@@ -151,6 +151,37 @@ Límites a saber:
 
 ---
 
+## Droplet SSHD-Conexion: SSH endurecido en DigitalOcean (stack aparte)
+
+Un droplet **Rocky Linux 9** en DigitalOcean con SSH + PAM endurecidos. Terraform crea el droplet
+y el firewall (`infra/environments/do-sshd`) y Ansible hace el hardening (`infra/ansible/do-sshd`):
+
+- Solo entra **tu usuario**, con **tu llave RSA 4096 y el código de Google Authenticator**.
+  root no entra y el password de Unix no sirve por SSH (es solo para `sudo`).
+- SSH en el puerto **3947** (configurable, sin ningún `2`: nunca el 22) y el firewall de DigitalOcean solo
+  deja llegar **desde tu IP pública**.
+- Banner de acceso restringido, SELinux en enforcing, criptografía moderna, y sshd/PAM sin
+  las opciones que no se usan (forwarding, X11, GSSAPI, motd, etc.).
+
+> DigitalOcean no acepta `_` en nombres de droplet: se llama `SSHD-Conexion` y lleva el
+> tag `SSHD_Conexion`.
+
+1. Crea los secrets del repo: `DIGITALOCEAN_TOKEN`, `SSH_PRIVATE_KEY` (tu llave privada RSA 4096
+   completa), `SSH_KEY_PASSPHRASE` (si tu llave tiene frase), `SUDO_PASSWORD` (12+ caracteres) y
+   `TOTP_SECRET` (secreto base32 que también registras en Google Authenticator).
+2. Actions → **sshd-deploy** → `plan`, luego `apply` + `deploy` en confirm, con tu IP en
+   `mi_ip` (la ves en https://ifconfig.me). El job prueba al final que root no entra, que la
+   llave sola no basta, que el 22 está cerrado y que llave + código + sudo sí funcionan.
+3. Conéctate con lo que diga el resumen del run, p. ej.
+   `ssh -i ~/.ssh/sshd_conexion -p 3947 operador@<IP>` (te pide el código de 6 dígitos).
+4. **sshd-destroy** al terminar (el droplet se cobra por hora).
+
+Sin state remoto (gratis): el workflow encuentra el droplet por su tag. Si ya existe, solo
+vuelve a aplicar el hardening (entra con tu usuario y el código). Si tu IP de casa cambió,
+corre `apply` de nuevo con la nueva y se actualiza el firewall.
+
+---
+
 ## Desarrollo local del backend
 
 ```bash

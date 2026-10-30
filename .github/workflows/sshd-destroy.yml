@@ -1,0 +1,92 @@
+name: sshd-destroy
+
+# Borra el droplet SSHD-Conexion (tag SSHD_Conexion) con su disco, su firewall, la llave
+# SSH que creo sshd-deploy y el tag. No hay state remoto: todo se busca por nombre/tag
+# con doctl. Los demas recursos de tu cuenta de DigitalOcean NO se tocan.
+# Manual: confirm debe ser "destroy".
+#
+# Requisitos: secret DIGITALOCEAN_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Escribe: destroy"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: do-sshd
+  cancel-in-progress: false
+
+env:
+  DROPLET_NAME: SSHD-Conexion
+  DROPLET_TAG: SSHD_Conexion
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar confirmacion
+        if: ${{ inputs.confirm != 'destroy' }}
+        run: |
+          echo "::error::Debes escribir 'destroy' en el campo confirm."
+          exit 1
+
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+
+      - name: Borrar droplet, firewall, llave y tag
+        run: |
+          set -euo pipefail
+          resumen=()
+
+          mapfile -t ids < <(doctl compute droplet list --tag-name "$DROPLET_TAG" --format ID --no-header)
+          for id in "${ids[@]}"; do
+            doctl compute droplet delete "$id" --force
+            # Esperar a que DigitalOcean confirme que ya no existe (max ~3 min).
+            for _ in $(seq 1 36); do
+              doctl compute droplet get "$id" > /dev/null 2>&1 || break
+              sleep 5
+            done
+            if doctl compute droplet get "$id" > /dev/null 2>&1; then
+              echo "::error::El droplet $id sigue existiendo"; exit 1
+            fi
+            resumen+=("| Droplet | $id | borrado (con su disco) |")
+          done
+
+          mapfile -t fws < <(doctl compute firewall list --format ID,Name --no-header | awk -v n="$DROPLET_NAME-fw" '$2 == n {print $1}')
+          for fw in "${fws[@]}"; do
+            doctl compute firewall delete "$fw" --force
+            resumen+=("| Firewall | $fw | borrado |")
+          done
+
+          # Solo la llave que creo el deploy (por nombre); si reuso una tuya, se queda.
+          mapfile -t keys < <(doctl compute ssh-key list --format ID,Name --no-header | awk -v n="$DROPLET_NAME-key" '$2 == n {print $1}')
+          for k in "${keys[@]}"; do
+            doctl compute ssh-key delete "$k" --force
+            resumen+=("| Llave SSH | $k | borrada |")
+          done
+
+          if doctl compute tag get "$DROPLET_TAG" > /dev/null 2>&1; then
+            doctl compute tag delete "$DROPLET_TAG" --force
+            resumen+=("| Tag | $DROPLET_TAG | borrado |")
+          fi
+
+          {
+            echo "### Recursos eliminados ($DROPLET_NAME)"
+            echo
+            if (( ${#resumen[@]} > 0 )); then
+              echo "| Recurso | ID | Estado |"
+              echo "|---|---|---|"
+              printf '%s\n' "${resumen[@]}"
+              echo
+              echo "Ya no cobra. Si lo vuelves a necesitar, corre **sshd-deploy**."
+            else
+              echo "No habia nada que borrar (ya estaba destruido)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

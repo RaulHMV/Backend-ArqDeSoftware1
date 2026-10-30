@@ -1,0 +1,303 @@
+---
+# Hardening de SSH + PAM en el droplet SSHD-Conexion (Rocky Linux 9, SELinux enforcing).
+#
+# Resultado:
+#  - Solo entra {{ admin_user }}, con su llave RSA 4096 Y el codigo de Google
+#    Authenticator. root no entra; el password de Unix no sirve para entrar por SSH.
+#  - SSH en el puerto {{ ssh_port }} (el 22 queda cerrado). El firewall de DigitalOcean
+#    (Terraform) solo deja llegar a ese puerto desde tu IP.
+#  - El password de {{ admin_user }} (secret SUDO_PASSWORD) es para sudo (grupo wheel).
+#  - Banner de acceso restringido antes de autenticarse.
+#  - sshd y PAM sin las opciones que no se usan.
+#
+# Requiere en el entorno: ADMIN_USER, SUDO_PASSWORD, TOTP_SECRET, SSH_KEY_FILE,
+# SSH_PUBLIC_KEY_FILE, SSH_PORT, DROPLET_IP, CONNECT_AS (root|admin) y
+# SSH_CONNECT_PORT. Lo arma el workflow.
+# Idempotente: se puede volver a correr ya endurecido (entra con llave + codigo).
+#
+# ORDEN IMPORTANTE: sshd se reinicia al FINAL (handler). Antes de eso ya deben estar
+# SELinux y firewalld con el puerto nuevo y la llave del servidor en 4096: si sshd no
+# arranca, nadie puede entrar. La sesion de Ansible ya abierta sobrevive al reinicio.
+
+- name: Hardening de SSH y PAM
+  hosts: sshd
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Esperar SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    # cloud-init todavia puede estar instalando paquetes en el primer boot
+    - name: Esperar a que cloud-init termine
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      failed_when: cloud_init.rc not in [0, 2]
+
+    - name: Validar parametros
+      ansible.builtin.assert:
+        that:
+          - admin_user is match('^[a-z_][a-z0-9_-]{0,31}$')
+          - admin_user != 'root'
+          - admin_password | length >= 12
+          - totp_secret is match('^[A-Z2-7]{16,}$')
+          - admin_pubkey is match('^ssh-rsa ')
+          - "'2' not in (ssh_port | string) and 1024 <= ssh_port | int <= 65535"
+        fail_msg: >-
+          Revisa: usuario en minusculas (no root), SUDO_PASSWORD de 12+ caracteres,
+          TOTP_SECRET en base32 (A-Z y 2-7, 16+ caracteres), llave RSA y puerto
+          entre 1024 y 65535 sin ningun 2.
+      no_log: true
+
+  tasks:
+    # ------------------------------------------------------------ Paquetes
+    # El modulo PAM de Google Authenticator viene de EPEL.
+    # python3-libselinux: Ansible lo necesita para escribir archivos con SELinux activo.
+    # policycoreutils-python-utils: trae semanage (puerto de SSH en SELinux).
+    - name: EPEL y utilerias de SELinux
+      ansible.builtin.dnf:
+        name:
+          - epel-release
+          - python3-libselinux
+          - policycoreutils-python-utils
+        state: present
+
+    # openssh a la ultima del repo: parches de seguridad y la version (9.9) para la
+    # que esta escrito el sshd_config.
+    - name: OpenSSH actualizado y modulo PAM de Google Authenticator
+      ansible.builtin.dnf:
+        name:
+          - openssh-server
+          - openssh
+          - google-authenticator
+        state: latest
+        update_cache: true
+      notify: Reiniciar sshd
+
+    # ------------------------------------------------------------ SELinux
+    - name: Estado de SELinux
+      ansible.builtin.command: getenforce
+      register: selinux
+      changed_when: false
+
+    # Todo esta pensado para enforcing (puerto etiquetado, secreto TOTP en ~/.ssh).
+    - name: SELinux en enforcing (ahora y al reiniciar)
+      when: selinux.stdout == 'Permissive'
+      block:
+        - name: Activar enforcing ahora
+          ansible.builtin.command: setenforce 1
+          changed_when: true
+
+        - name: Dejar enforcing permanente
+          ansible.builtin.lineinfile:
+            path: /etc/selinux/config
+            regexp: '^SELINUX='
+            line: SELINUX=enforcing
+
+    - name: Aviso si SELinux esta apagado
+      ansible.builtin.debug:
+        msg: >-
+          SELinux esta Disabled en esta imagen: el hardening funciona igual, pero para
+          activarlo hace falta reetiquetar el disco y reiniciar (no se hace solo).
+      when: selinux.stdout == 'Disabled'
+
+    # Sin esto sshd NO puede abrir el puerto {{ ssh_port }} con SELinux activo.
+    - name: SELinux permite a sshd usar el puerto {{ ssh_port }}
+      ansible.builtin.shell: |
+        if semanage port -l | grep -Eq "^ssh_port_t\s+tcp\s+(.*[ ,])?{{ ssh_port }}(,|$)"; then
+          echo sin_cambio
+        else
+          semanage port -a -t ssh_port_t -p tcp {{ ssh_port }} 2>/dev/null \
+            || semanage port -m -t ssh_port_t -p tcp {{ ssh_port }}
+        fi
+      register: seport
+      changed_when: "'sin_cambio' not in seport.stdout"
+      when: selinux.stdout != 'Disabled'
+
+    # ------------------------------------------------------------ firewalld
+    # La imagen de DO normalmente no lo trae activo (filtra el firewall de DO), pero si
+    # esta activo: abre {{ ssh_port }} y cierra el 22. Las sesiones abiertas no se cortan.
+    - name: Ver si firewalld esta activo
+      ansible.builtin.command: systemctl is-active firewalld
+      register: firewalld
+      changed_when: false
+      failed_when: false
+
+    - name: firewalld solo con el puerto {{ ssh_port }}
+      ansible.builtin.shell: |
+        set -e
+        cambio=no
+        if ! firewall-cmd --permanent --query-port={{ ssh_port }}/tcp >/dev/null; then
+          firewall-cmd --permanent --add-port={{ ssh_port }}/tcp >/dev/null; cambio=si
+        fi
+        if firewall-cmd --permanent --query-service=ssh >/dev/null; then
+          firewall-cmd --permanent --remove-service=ssh >/dev/null; cambio=si
+        fi
+        if [ "$cambio" = si ]; then firewall-cmd --reload >/dev/null; fi
+        echo "$cambio"
+      register: fw
+      changed_when: fw.stdout == 'si'
+      when: firewalld.stdout == 'active'
+
+    # ------------------------------------------------------------ Usuario
+    # Salt fijo (derivado del usuario): mismo hash en cada corrida, sin "changed" falso.
+    - name: Usuario {{ admin_user }} (sudo con password)
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        groups: "{{ sudo_group }}"
+        append: true
+        password: "{{ admin_password | password_hash('sha512', (admin_user ~ '-sshd') | hash('sha256') | truncate(16, true, '', 0)) }}"
+        update_password: always
+      no_log: true
+
+    - name: Carpeta .ssh
+      ansible.builtin.file:
+        path: "/home/{{ admin_user }}/.ssh"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0700"
+        setype: ssh_home_t
+
+    # Exclusivo: solo tu llave RSA 4096, cualquier otra se borra.
+    - name: Solo tu llave publica puede entrar
+      ansible.builtin.copy:
+        dest: "/home/{{ admin_user }}/.ssh/authorized_keys"
+        content: "{{ admin_pubkey | trim }}\n"
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0600"
+        setype: ssh_home_t
+
+    # El modulo PAM reescribe este archivo en cada login (guarda los codigos usados para
+    # DISALLOW_REUSE y RATE_LIMIT): solo se escribe si falta o si cambio el secreto.
+    - name: Leer secreto TOTP actual
+      ansible.builtin.slurp:
+        src: "{{ totp_file }}"
+      register: ga_actual
+      failed_when: false
+      no_log: true
+
+    - name: Google Authenticator para {{ admin_user }}
+      ansible.builtin.copy:
+        dest: "{{ totp_file }}"
+        content: |
+          {{ totp_secret }}
+          " RATE_LIMIT 3 30
+          " WINDOW_SIZE 3
+          " DISALLOW_REUSE
+          " TOTP_AUTH
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0400"
+        setype: ssh_home_t
+      when: >-
+        ga_actual.content is not defined
+        or (ga_actual.content | b64decode).splitlines()[0] != totp_secret
+      no_log: true
+
+    # root sin password: no puede entrar ni por consola con password.
+    # (Si te quedas fuera: panel de DO -> Reset root password -> Recovery Console.)
+    - name: Bloquear el password de root
+      ansible.builtin.user:
+        name: root
+        password_lock: true
+
+    # ------------------------------------------------------------ sudo
+    - name: Endurecer sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-hardening
+        content: |
+          # {{ ansible_managed }}
+          Defaults use_pty
+          Defaults logfile="/var/log/sudo.log"
+          Defaults passwd_tries=3
+          Defaults timestamp_timeout=5
+        owner: root
+        group: root
+        mode: "0440"
+        validate: visudo -cf %s
+
+    # ------------------------------------------------------------ Banner
+    - name: Banner antes de autenticarse (SSH) y en la consola
+      ansible.builtin.copy:
+        dest: "{{ item }}"
+        content: "{{ banner_text }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - /etc/issue.net
+        - /etc/issue
+
+    # ------------------------------------------------------------ PAM
+    - name: Solo {{ admin_user }} pasa el control de acceso de PAM
+      ansible.builtin.copy:
+        dest: /etc/security/access-sshd.conf
+        content: |
+          # {{ ansible_managed }}
+          + : {{ admin_user }} : ALL
+          - : ALL : ALL
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: PAM de sshd (llave + codigo TOTP, sin modulos que no se usan)
+      ansible.builtin.template:
+        src: pam_sshd.j2
+        dest: /etc/pam.d/sshd
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+
+    # ------------------------------------------------------------ sshd
+    # Rocky crea la llave RSA del servidor de 3072 bits; con RequiredRSASize 4096 sshd
+    # ni siquiera arrancaria con ella. Se regenera a 4096 (solo si hace falta).
+    - name: Tamano de la llave RSA del servidor
+      ansible.builtin.command: ssh-keygen -l -f /etc/ssh/ssh_host_rsa_key.pub
+      register: hostkey_rsa
+      changed_when: false
+      failed_when: false
+
+    - name: Llave RSA del servidor de 4096 bits
+      ansible.builtin.shell: |
+        set -e
+        rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub
+        ssh-keygen -q -t rsa -b 4096 -N "" -C "" -f /etc/ssh/ssh_host_rsa_key
+        chgrp ssh_keys /etc/ssh/ssh_host_rsa_key
+        chmod 0640 /etc/ssh/ssh_host_rsa_key
+        if selinuxenabled; then restorecon /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub; fi
+      when: hostkey_rsa.rc != 0 or (hostkey_rsa.stdout.split()[0] | int) < 4096
+      notify: Reiniciar sshd
+
+    # root ya no podra entrar (PermitRootLogin no + pam_access); ademas se le quita la
+    # llave que DigitalOcean le puso al crear el droplet.
+    - name: Quitar la llave de root
+      ansible.builtin.copy:
+        dest: /root/.ssh/authorized_keys
+        content: ""
+        owner: root
+        group: root
+        mode: "0600"
+
+    # validate: si la config tiene un error, no se escribe y sshd sigue como estaba.
+    - name: sshd_config endurecido
+      ansible.builtin.template:
+        src: sshd_config.j2
+        dest: /etc/ssh/sshd_config
+        owner: root
+        group: root
+        mode: "0600"
+        backup: true
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Reiniciar sshd
+
+  handlers:
+    - name: Reiniciar sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted

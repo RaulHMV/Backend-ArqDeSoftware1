@@ -1,0 +1,80 @@
+# {{ ansible_managed }}
+# sshd endurecido (Rocky Linux 9, OpenSSH 9.9). Fuente: infra/ansible/do-sshd.
+# Sin "Include /etc/ssh/sshd_config.d/*.conf": ni 50-redhat.conf (GSSAPI, X11 y la
+# crypto-policy general) ni el de cloud-init pueden reabrir lo que se cierra aqui.
+
+# ---------------------------------------------------------------- Red
+# Solo este puerto (el 22 queda cerrado). SELinux y el firewall de DO ya lo permiten.
+Port {{ ssh_port }}
+AddressFamily inet
+
+# ---------------------------------------------------------------- Llaves: RSA 4096
+# El servidor se identifica con su llave RSA de 4096 bits (la regenera el playbook).
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# ---------------------------------------------------------------- Criptografia moderna
+# sntrup761 (post-cuantico) primero; curve25519 para clientes anteriores.
+# PuTTY 0.80+ (trae la proteccion contra Terrapin) o OpenSSH 8.5+.
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+# Solo RSA con SHA-2 (nunca ssh-rsa con SHA-1) y llaves de 4096 bits o mas.
+HostKeyAlgorithms rsa-sha2-512,rsa-sha2-256
+PubkeyAcceptedAlgorithms rsa-sha2-512,rsa-sha2-256
+RequiredRSASize 4096
+
+# ---------------------------------------------------------------- Quien entra y como
+# Solo {{ admin_user }}, y SIEMPRE con las dos cosas: su llave RSA 4096 Y el codigo
+# de Google Authenticator (keyboard-interactive -> PAM -> pam_google_authenticator).
+PermitRootLogin no
+AllowUsers {{ admin_user }}
+AuthenticationMethods publickey,keyboard-interactive
+PubkeyAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+
+# Sin password de Unix por SSH (el password de {{ admin_user }} es solo para sudo).
+PasswordAuthentication no
+PermitEmptyPasswords no
+
+# Metodos que no se usan.
+HostbasedAuthentication no
+IgnoreRhosts yes
+GSSAPIAuthentication no
+KerberosAuthentication no
+
+# Limites contra fuerza bruta y conexiones colgadas.
+MaxAuthTries 3
+LoginGraceTime 30
+MaxStartups 10:30:60
+MaxSessions 4
+ClientAliveInterval 300
+ClientAliveCountMax 2
+TCPKeepAlive no
+
+# ---------------------------------------------------------------- Lo que no se usa: apagado
+DisableForwarding yes
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+GatewayPorts no
+PermitTunnel no
+PermitUserEnvironment no
+PermitUserRC no
+Compression no
+UseDNS no
+# Sin AcceptEnv: el cliente no puede inyectar variables de entorno.
+
+# ---------------------------------------------------------------- Banner y bitacora
+Banner /etc/issue.net
+PrintMotd no
+PrintLastLog yes
+# AUTHPRIV -> /var/log/secure (lo estandar en Rocky/RHEL).
+SyslogFacility AUTHPRIV
+# VERBOSE registra el fingerprint de la llave con la que entro cada quien.
+LogLevel VERBOSE
+
+Subsystem sftp internal-sftp

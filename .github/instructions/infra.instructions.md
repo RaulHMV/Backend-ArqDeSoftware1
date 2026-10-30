@@ -60,6 +60,19 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
   varios en una máquina). Límite probado: dos nodos editando la MISMA fila a la vez divergen
   (PG16 no detecta conflictos; a diferencia de Group Replication).
 
+- `environments/do-sshd/` + `ansible/do-sshd/`: DigitalOcean (provider digitalocean, token por env
+  `DIGITALOCEAN_TOKEN`), SIN backend remoto: el workflow busca el droplet por tag `SSHD_Conexion`
+  (nombre `SSHD-Conexion`: DO no acepta `_` en nombres). Rocky Linux 9 (`rockylinux-9-x64`),
+  firewall de DO solo `my_ip` en `ssh_port` (default 3947; NINGUN digito 2, regla del profe). Playbook: usuario en `wheel`
+  con llave RSA 4096 exclusiva + Google Authenticator (EPEL), `AuthenticationMethods
+  publickey,keyboard-interactive`, PAM sin common-auth (solo pam_google_authenticator) +
+  pam_access, sin Include de sshd_config.d, `RequiredRSASize 4096` (regenera la host key RSA a
+  4096 ANTES del template), `semanage port` para ssh_port_t, sshd se reinicia al final.
+  Gotchas probados: con SELinux el secreto TOTP va en `~/.ssh/.google_authenticator`
+  (`secret=${HOME}/...`, ssh_home_t; en `~` sshd no puede reescribirlo); `mlkem768x25519-sha256`
+  no lo acepta el sshd de Rocky; re-runs entran como el usuario con el codigo de
+  `files/totp.py` via el askpass de Ansible (`ansible_sshpass_prompt: "Verification code:"`).
+
 ## Stack (modules/stack) — puntos clave
 - DynamoDB main (PK/SK, 4 GSIs, Streams NEW_AND_OLD_IMAGES, PITR en prod) + WSConnections.
 - Cognito (email username, `custom:areaId`, grupos Requester/Agent/Manager/Admin,

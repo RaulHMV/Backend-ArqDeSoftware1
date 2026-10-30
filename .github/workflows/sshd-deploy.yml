@@ -1,0 +1,410 @@
+name: sshd-deploy
+
+# Crea (o vuelve a endurecer) el droplet SSHD-Conexion en DigitalOcean con Rocky Linux 9
+# y le hace hardening de SSH + PAM con Google Authenticator:
+#   - Terraform: droplet, llave SSH y firewall (SOLO tu IP y SOLO el puerto de SSH).
+#   - Ansible: usuario con llave RSA 4096 + codigo TOTP, sudo con password, banner,
+#     sshd y PAM sin lo que no se usa, puerto sin ningun 2 (nunca el 22), SELinux.
+#
+# SIN state remoto (gratis): el droplet se busca por su tag SSHD_Conexion.
+#   - No existe -> Terraform lo crea y Ansible entra como root por el 22 (primera vez).
+#   - Ya existe -> solo se re-aplica Ansible (entra con tu usuario: llave + codigo TOTP).
+# Para borrarlo: sshd-destroy.
+#
+# Despliegue MANUAL: GitHub > Actions > sshd-deploy > Run workflow.
+# Secrets (Settings > Secrets and variables > Actions):
+#   - DIGITALOCEAN_TOKEN: token de API de DigitalOcean (permiso de escritura).
+#   - SSH_PRIVATE_KEY:    tu llave PRIVADA RSA 4096 completa (ssh-keygen o .ppk de PuTTYgen).
+#   - SSH_KEY_PASSPHRASE: (opcional) la frase de esa llave, si le pusiste.
+#   - SUDO_PASSWORD:      password de sudo de tu usuario (12+ caracteres).
+#   - TOTP_SECRET:        secreto base32 de Google Authenticator (ver README).
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "plan (solo previsualiza) o apply (crea/endurece de verdad)"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+      confirm:
+        description: 'Para "apply" escribe: deploy'
+        required: false
+        default: ""
+        type: string
+      mi_ip:
+        description: "Tu IP publica: la UNICA que podra entrar por SSH (la ves en https://ifconfig.me)"
+        required: true
+        type: string
+      usuario:
+        description: "Usuario que podra entrar por SSH (minusculas)"
+        required: true
+        default: operador
+        type: string
+      puerto_ssh:
+        description: "Puerto de SSH (sin ningun 2: nunca el 22)"
+        required: true
+        default: "3947"
+        type: string
+      region:
+        description: "Region de DigitalOcean"
+        required: true
+        default: sfo3
+        type: string
+      size:
+        description: "Tamano del droplet"
+        required: true
+        default: s-1vcpu-1gb
+        type: string
+
+permissions:
+  contents: read
+
+# Un solo run a la vez sobre el droplet (deploy y destroy comparten grupo).
+concurrency:
+  group: do-sshd
+  cancel-in-progress: false
+
+env:
+  TF_DIR: infra/environments/do-sshd
+  ANSIBLE_DIR: infra/ansible/do-sshd
+  # DigitalOcean no acepta "_" en el nombre: el nombre lleva "-" y el tag lleva "_".
+  DROPLET_NAME: SSHD-Conexion
+  DROPLET_TAG: SSHD_Conexion
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ACTION: ${{ inputs.action }}
+      MI_IP: ${{ inputs.mi_ip }}
+      ADMIN_USER: ${{ inputs.usuario }}
+      SSH_PORT: ${{ inputs.puerto_ssh }}
+      TF_VAR_region: ${{ inputs.region }}
+      TF_VAR_size: ${{ inputs.size }}
+      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+    steps:
+      - name: Validar confirmacion (solo apply)
+        if: ${{ inputs.action == 'apply' && inputs.confirm != 'deploy' }}
+        run: |
+          echo "::error::Para 'apply' debes escribir 'deploy' en el campo confirm."
+          exit 1
+
+      # Falla rapido y claro antes de tocar DigitalOcean.
+      - name: Validar parametros y secrets
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
+        run: |
+          err=0
+          fail() { echo "::error::$1"; err=1; }
+          [[ "$MI_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "mi_ip debe ser una IPv4 sin mascara, ej. 203.0.113.7"
+          [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$ADMIN_USER" != root ]] || fail "usuario: minusculas/numeros/_/-, sin espacios, y no root"
+          if [[ ! "$SSH_PORT" =~ ^[0-9]+$ || "$SSH_PORT" == *2* ]] || (( SSH_PORT < 1024 || SSH_PORT > 65535 )); then
+            fail "puerto_ssh debe estar entre 1024 y 65535 y no puede llevar ningun 2 (ej. 3947)"
+          fi
+          [[ -n "$DIGITALOCEAN_TOKEN" ]] || fail "Falta el secret DIGITALOCEAN_TOKEN"
+          [[ -n "$SSH_PRIVATE_KEY" ]] || fail "Falta el secret SSH_PRIVATE_KEY"
+          (( ${#SUDO_PASSWORD} >= 12 )) || fail "El secret SUDO_PASSWORD debe existir y tener 12+ caracteres"
+          totp=$(tr -d ' =' <<< "${TOTP_SECRET^^}")
+          [[ "$totp" =~ ^[A-Z2-7]{16,}$ ]] || fail "El secret TOTP_SECRET debe ser base32 (A-Z y 2-7), 16+ caracteres"
+          exit $err
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          # Sin wrapper: necesitamos la salida limpia de `terraform output`.
+          terraform_wrapper: false
+
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+
+      # Acepta la llave de ssh-keygen (OpenSSH) o el .ppk de PuTTYgen; con o sin frase.
+      # Deja en el runner una copia sin frase (solo vive durante el job) y su publica.
+      - name: Preparar llave (debe ser RSA de 4096 bits o mas)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="$RUNNER_TEMP/sshd_key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/llave_entrada"
+          if grep -q '^PuTTY-User-Key-File-' "$RUNNER_TEMP/llave_entrada"; then
+            sudo apt-get install -y -qq putty-tools > /dev/null
+            printf '%s\n' "${SSH_KEY_PASSPHRASE:-}" > "$RUNNER_TEMP/frase"
+            : > "$RUNNER_TEMP/sin_frase"
+            puttygen "$RUNNER_TEMP/llave_entrada" --old-passphrase "$RUNNER_TEMP/frase" \
+              --new-passphrase "$RUNNER_TEMP/sin_frase" -O private-openssh-new -o "$KEY" \
+              || { echo "::error::No se pudo leer el .ppk (revisa SSH_KEY_PASSPHRASE)"; exit 1; }
+          else
+            cp "$RUNNER_TEMP/llave_entrada" "$KEY"
+            if [[ -n "${SSH_KEY_PASSPHRASE:-}" ]]; then
+              ssh-keygen -q -p -P "$SSH_KEY_PASSPHRASE" -N "" -f "$KEY" > /dev/null \
+                || { echo "::error::SSH_KEY_PASSPHRASE no abre la llave"; exit 1; }
+            fi
+          fi
+          rm -f "$RUNNER_TEMP/llave_entrada" "$RUNNER_TEMP/frase"
+          ssh-keygen -y -P "" -f "$KEY" > "$KEY.pub" \
+            || { echo "::error::SSH_PRIVATE_KEY no es una llave privada valida (o tiene frase y falta SSH_KEY_PASSPHRASE)"; exit 1; }
+          bits=$(ssh-keygen -l -f "$KEY.pub" | awk '{print $1}')
+          tipo=$(ssh-keygen -l -f "$KEY.pub" | awk '{print $NF}')
+          if [[ "$tipo" != "(RSA)" ]] || (( bits < 4096 )); then
+            echo "::error::La llave es $tipo de $bits bits: debe ser RSA de 4096 bits o mas (ssh-keygen -t rsa -b 4096)."
+            exit 1
+          fi
+          {
+            echo "SSH_KEY_FILE=$KEY"
+            echo "SSH_PUBLIC_KEY_FILE=$KEY.pub"
+            echo "KEY_MD5=$(ssh-keygen -l -E md5 -f "$KEY.pub" | awk '{print $2}' | sed 's/^MD5://')"
+            echo "KEY_SHA256=$(ssh-keygen -l -f "$KEY.pub" | awk '{print $2}')"
+          } >> "$GITHUB_ENV"
+          echo "Llave RSA de $bits bits OK"
+
+      - name: Buscar el droplet por su tag
+        id: buscar
+        run: |
+          set -euo pipefail
+          mapfile -t filas < <(doctl compute droplet list --tag-name "$DROPLET_TAG" --format ID,PublicIPv4 --no-header)
+          if (( ${#filas[@]} > 1 )); then
+            echo "::error::Hay ${#filas[@]} droplets con el tag $DROPLET_TAG; deja solo uno (o corre sshd-destroy)."
+            exit 1
+          fi
+          if (( ${#filas[@]} == 1 )); then
+            read -r id ip <<< "${filas[0]}"
+            echo "existe=true" >> "$GITHUB_OUTPUT"
+            { echo "DROPLET_ID=$id"; echo "DROPLET_IP=$ip"; } >> "$GITHUB_ENV"
+            echo "Ya existe: $DROPLET_NAME (id $id, ip $ip) -> solo se re-aplica Ansible."
+          else
+            echo "existe=false" >> "$GITHUB_OUTPUT"
+            echo "No existe: Terraform lo crea."
+          fi
+
+      # ------------------------------------------------------------ Droplet nuevo
+      # Restos de un droplet borrado a mano: el firewall huerfano se borra (si no,
+      # habria dos con el mismo nombre). La llave se reusa si ya esta en la cuenta.
+      - name: Limpiar restos y reusar la llave si ya esta en DigitalOcean
+        if: ${{ steps.buscar.outputs.existe == 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ "$ACTION" == apply ]]; then
+            doctl compute firewall list --format ID,Name --no-header \
+              | awk -v n="$DROPLET_NAME-fw" '$2 == n {print $1}' \
+              | while read -r fw; do
+                  echo "Borrando firewall huerfano $fw"
+                  doctl compute firewall delete "$fw" --force
+                done
+          fi
+          if doctl compute ssh-key get "$KEY_MD5" > /dev/null 2>&1; then
+            echo "La llave ya esta en la cuenta ($KEY_MD5): se reusa."
+            echo "TF_VAR_existing_ssh_key_fingerprint=$KEY_MD5" >> "$GITHUB_ENV"
+          fi
+
+      - name: Terraform Init
+        if: ${{ steps.buscar.outputs.existe == 'false' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        if: ${{ steps.buscar.outputs.existe == 'false' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -input=false -out=tfplan \
+            -var "ssh_public_key=$(cat "$SSH_PUBLIC_KEY_FILE")" \
+            -var "my_ip=$MI_IP" -var "ssh_port=$SSH_PORT" \
+            -var "droplet_name=$DROPLET_NAME" -var "droplet_tag=$DROPLET_TAG"
+
+      # Aplica exactamente el plan de arriba (no recalcula).
+      - name: Terraform Apply
+        if: ${{ steps.buscar.outputs.existe == 'false' && inputs.action == 'apply' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -input=false tfplan
+          {
+            echo "DROPLET_ID=$(terraform output -raw droplet_id)"
+            echo "DROPLET_IP=$(terraform output -raw droplet_ip)"
+            echo "FW_ID=$(terraform output -raw firewall_id)"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------ Droplet existente
+      # Si tu IP cambio (pasa seguido en casa), se actualiza la regla del firewall.
+      - name: Firewall del droplet existente (puerto y tu IP)
+        if: ${{ steps.buscar.outputs.existe == 'true' && inputs.action == 'apply' }}
+        run: |
+          set -euo pipefail
+          fw=$(doctl compute firewall list --format ID,Name --no-header | awk -v n="$DROPLET_NAME-fw" '$2 == n {print $1}' | head -1)
+          [[ -n "$fw" ]] || { echo "::error::No encontre el firewall $DROPLET_NAME-fw; corre sshd-destroy y vuelve a crear."; exit 1; }
+          echo "FW_ID=$fw" >> "$GITHUB_ENV"
+          reglas=$(doctl compute firewall get "$fw" --output json | jq -c '.[0].inbound_rules // []')
+          puerto=$(jq -r '[.[] | select(.ports != "22") | .ports] | unique | first // empty' <<< "$reglas")
+          if [[ -n "$puerto" && "$puerto" != "$SSH_PORT" ]]; then
+            echo "::error::El droplet usa el puerto $puerto. Para cambiarlo corre sshd-destroy y vuelve a crear."
+            exit 1
+          fi
+          # Fuera todo lo que no sea tu IP (incluye reglas viejas de runners en el 22).
+          jq -r '.[] | .ports as $p | (.sources.addresses // [])[] | "\($p) \(.)"' <<< "$reglas" \
+            | while read -r p addr; do
+                if [[ "$p" != "$SSH_PORT" || "$addr" != "$MI_IP/32" ]]; then
+                  echo "Quitando regla $addr -> $p"
+                  doctl compute firewall remove-rules "$fw" --inbound-rules "protocol:tcp,ports:$p,address:$addr"
+                fi
+              done
+          if ! jq -e --arg ip "$MI_IP/32" --arg p "$SSH_PORT" '.[] | select(.ports == $p) | .sources.addresses // [] | index($ip)' <<< "$reglas" > /dev/null; then
+            echo "Agregando tu IP $MI_IP -> $SSH_PORT"
+            doctl compute firewall add-rules "$fw" --inbound-rules "protocol:tcp,ports:$SSH_PORT,address:$MI_IP/32"
+          fi
+
+      - name: Solo plan
+        if: ${{ inputs.action == 'plan' }}
+        env:
+          EXISTE: ${{ steps.buscar.outputs.existe }}
+        run: |
+          if [[ "$EXISTE" == true ]]; then
+            echo "El droplet ya existe: con apply se re-aplicaria el hardening (Ansible)."
+          else
+            echo "Con apply se crea lo del plan de Terraform y luego se endurece con Ansible."
+          fi
+
+      # ------------------------------------------------------------ Acceso temporal del runner
+      # El runner de GitHub tiene una IP distinta en cada run: se le abre el 22 (primera
+      # conexion, como root) y el puerto de SSH solo mientras dura el job.
+      - name: Abrir el firewall a la IP del runner (temporal)
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          set -euo pipefail
+          runner_ip=$(curl -fsS https://api.ipify.org)
+          [[ "$runner_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "::error::No pude saber la IP del runner"; exit 1; }
+          echo "RUNNER_IP=$runner_ip" >> "$GITHUB_ENV"
+          doctl compute firewall add-rules "$FW_ID" \
+            --inbound-rules "protocol:tcp,ports:22,address:$runner_ip/32 protocol:tcp,ports:$SSH_PORT,address:$runner_ip/32"
+          sleep 10
+
+      - name: Como entrar (root la primera vez, tu usuario despues)
+        if: ${{ inputs.action == 'apply' }}
+        env:
+          NUEVO: ${{ steps.buscar.outputs.existe == 'false' }}
+        run: |
+          ssh_ok() { ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o ConnectTimeout=10 \
+                       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                       -i "$SSH_KEY_FILE" "$@" true 2> /dev/null; }
+          if [[ "$NUEVO" == true ]] || ssh_ok -p 22 "root@$DROPLET_IP"; then
+            como=root; puerto=22
+          elif timeout 5 bash -c "</dev/tcp/$DROPLET_IP/$SSH_PORT" 2> /dev/null; then
+            como=admin; puerto=$SSH_PORT
+          else
+            como=admin; puerto=22
+          fi
+          echo "Ansible entra como $como por el puerto $puerto"
+          { echo "CONNECT_AS=$como"; echo "SSH_CONNECT_PORT=$puerto"; } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        if: ${{ inputs.action == 'apply' }}
+        with:
+          python-version: "3.12"
+
+      # Version FIJA (la probada). El runner trae su propio Ansible que cambia solo: no se usa.
+      # passlib: para password_hash (el hash del password de sudo).
+      - name: Instalar Ansible
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          python -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/pip" install --quiet "ansible-core==2.21.4" passlib
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Hardening (Ansible)
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: ${{ env.ANSIBLE_DIR }}
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
+        run: ansible-playbook playbook.yml
+
+      # Pruebas desde fuera, con conexiones NUEVAS (no reusa la sesion de Ansible).
+      - name: Verificar el hardening
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: ${{ env.ANSIBLE_DIR }}
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
+        run: |
+          set -uo pipefail
+          # Solo publickey: estas pruebas nunca llegan a pedir codigo (no gastan RATE_LIMIT).
+          SSH=(ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o ConnectTimeout=10
+               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+               -i "$SSH_KEY_FILE" -p "$SSH_PORT")
+          ok=1
+          bien() { echo "OK    $1"; }
+          mal()  { echo "::error::FALLA $1"; ok=0; }
+
+          if timeout 5 bash -c "</dev/tcp/$DROPLET_IP/22" 2> /dev/null; then
+            mal "el puerto 22 sigue abierto"
+          else
+            bien "el puerto 22 esta cerrado"
+          fi
+
+          if "${SSH[@]}" "root@$DROPLET_IP" true 2> /dev/null; then
+            mal "root pudo entrar"
+          else
+            bien "root no puede entrar"
+          fi
+
+          salida=$("${SSH[@]}" "$ADMIN_USER@$DROPLET_IP" true 2>&1) && mal "entro solo con la llave (sin codigo TOTP)" \
+            || bien "solo la llave no basta: pide el codigo de Google Authenticator"
+          grep -q "NO CONTINUES SI NO TIENES PERMISOS" <<< "$salida" && bien "se muestra el banner" || mal "no aparece el banner"
+
+          # Codigo de una ventana de 30 s nueva (DISALLOW_REUSE rechaza uno ya usado).
+          sleep $(( 31 - $(date +%s) % 30 ))
+          if CONNECT_AS=admin SSH_CONNECT_PORT="$SSH_PORT" \
+             ANSIBLE_SSH_ARGS="-o ControlMaster=no -o ControlPath=none" \
+             ansible sshd --playbook-dir . -b -m ansible.builtin.command -a "id -un" | grep -q '^root$'; then
+            bien "llave + codigo TOTP entra, y sudo funciona con el password"
+          else
+            mal "no se pudo entrar con llave + codigo TOTP o sudo fallo"
+          fi
+          (( ok == 1 ))
+
+      - name: Huella de la llave del servidor
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          huella=$(ssh-keyscan -p "$SSH_PORT" -t rsa "$DROPLET_IP" 2> /dev/null | ssh-keygen -lf - | awk '{print $1" bits "$2}')
+          echo "HOST_FP=$huella" >> "$GITHUB_ENV"
+
+      # SIEMPRE (aunque algo falle): el runner deja de tener acceso.
+      - name: Cerrar el firewall a la IP del runner
+        if: ${{ always() && inputs.action == 'apply' && env.FW_ID != '' && env.RUNNER_IP != '' }}
+        run: |
+          doctl compute firewall remove-rules "$FW_ID" \
+            --inbound-rules "protocol:tcp,ports:22,address:$RUNNER_IP/32 protocol:tcp,ports:$SSH_PORT,address:$RUNNER_IP/32"
+          echo "Acceso del runner retirado: solo queda tu IP ($MI_IP) en el puerto $SSH_PORT."
+
+      - name: Resumen
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          {
+            echo "### Droplet $DROPLET_NAME (Rocky Linux 9) endurecido"
+            echo
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| IP | \`$DROPLET_IP\` |"
+            echo "| Puerto SSH | \`$SSH_PORT\` (el 22 esta cerrado) |"
+            echo "| Usuario | \`$ADMIN_USER\` (sudo con tu SUDO_PASSWORD) |"
+            echo "| Solo entra desde | \`$MI_IP\` |"
+            echo "| Tu llave | RSA \`$KEY_SHA256\` |"
+            echo "| Huella del servidor | RSA \`$HOST_FP\` |"
+            echo
+            echo "Conectate (te pedira el codigo de Google Authenticator):"
+            echo
+            echo '```bash'
+            echo "ssh -i ~/.ssh/sshd_conexion -p $SSH_PORT $ADMIN_USER@$DROPLET_IP"
+            echo '```'
+            echo
+            echo "La primera vez, compara la huella que te muestre ssh con la de esta tabla."
+            echo "Recuerda correr **sshd-destroy** cuando termines: el droplet se cobra por hora."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+# Un solo host; la IP la pone el workflow (DROPLET_IP). Las variables de conexion
+# (usuario, llave, codigo TOTP) estan en group_vars/sshd.yml.
+sshd:
+  hosts:
+    SSHD-Conexion:
+      ansible_host: "{{ lookup('env', 'DROPLET_IP') }}"
