@@ -281,7 +281,7 @@
       ansible.builtin.copy:
         dest: /etc/sudoers.d/90-hardening
         content: |
-          # {{ ansible_managed }}
+          # Gestionado por Ansible (infra/ansible/do-sshd). No editar a mano.
           Defaults use_pty
           Defaults logfile="/var/log/sudo.log"
           Defaults passwd_tries=3
@@ -308,7 +308,7 @@
       ansible.builtin.copy:
         dest: /etc/security/access-sshd.conf
         content: |
-          # {{ ansible_managed }}
+          # Gestionado por Ansible (infra/ansible/do-sshd). No editar a mano.
           + : {{ admin_user }} : ALL
           - : ALL : ALL
         owner: root
