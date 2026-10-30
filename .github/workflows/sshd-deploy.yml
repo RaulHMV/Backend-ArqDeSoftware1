@@ -128,6 +128,8 @@ jobs:
 
       # Acepta la llave de ssh-keygen (OpenSSH) o el .ppk de PuTTYgen; con o sin frase.
       # Deja en el runner una copia sin frase (solo vive durante el job) y su publica.
+      # Tolera lo que se cuela al pegar en GitHub: \r, espacios y saltos de linea de mas
+      # (en la llave y al final de la frase), y dice exactamente que esta mal si falla.
       - name: Preparar llave (debe ser RSA de 4096 bits o mas)
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -135,30 +137,69 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          error() { echo "::error::$1"; exit 1; }
           KEY="$RUNNER_TEMP/sshd_key"
-          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/llave_entrada"
-          if grep -q '^PuTTY-User-Key-File-' "$RUNNER_TEMP/llave_entrada"; then
+          ENTRADA="$RUNNER_TEMP/llave_entrada"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/./,$!d' > "$ENTRADA"
+          # Frases a probar: tal cual (sin \r ni saltos finales) y sin espacios a los lados.
+          cruda=$(printf '%s' "${SSH_KEY_PASSPHRASE:-}" | tr -d '\r')
+          limpia=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<< "$cruda")
+          frases=("$cruda")
+          [[ "$limpia" != "$cruda" ]] && frases+=("$limpia")
+
+          case "$(head -1 "$ENTRADA")" in
+            PuTTY-User-Key-File-*) formato=ppk ;;
+            "-----BEGIN "*"PRIVATE KEY-----") formato=openssh ;;
+            ssh-rsa\ * | ssh-ed25519\ * | ecdsa-*)
+              error "SSH_PRIVATE_KEY tiene tu llave PUBLICA (.pub). Pega la PRIVADA: cat ~/.ssh/sshd_conexion" ;;
+            *)
+              error "SSH_PRIVATE_KEY no empieza con '-----BEGIN ... PRIVATE KEY-----'. Pega TODO el archivo, de BEGIN a END." ;;
+          esac
+
+          abierta=no
+          if [[ $formato == ppk ]]; then
             sudo apt-get install -y -qq putty-tools > /dev/null
-            printf '%s\n' "${SSH_KEY_PASSPHRASE:-}" > "$RUNNER_TEMP/frase"
             : > "$RUNNER_TEMP/sin_frase"
-            puttygen "$RUNNER_TEMP/llave_entrada" --old-passphrase "$RUNNER_TEMP/frase" \
-              --new-passphrase "$RUNNER_TEMP/sin_frase" -O private-openssh-new -o "$KEY" \
-              || { echo "::error::No se pudo leer el .ppk (revisa SSH_KEY_PASSPHRASE)"; exit 1; }
+            for f in "${frases[@]}"; do
+              printf '%s\n' "$f" > "$RUNNER_TEMP/frase"
+              if puttygen "$ENTRADA" --old-passphrase "$RUNNER_TEMP/frase" --new-passphrase "$RUNNER_TEMP/sin_frase" \
+                   -O private-openssh-new -o "$KEY" 2> /dev/null; then
+                abierta=si; break
+              fi
+            done
+            rm -f "$RUNNER_TEMP/frase"
+            [[ $abierta == si ]] || error "No pude abrir el .ppk: SSH_KEY_PASSPHRASE no es su frase (o el archivo esta incompleto)."
           else
-            cp "$RUNNER_TEMP/llave_entrada" "$KEY"
-            if [[ -n "${SSH_KEY_PASSPHRASE:-}" ]]; then
-              ssh-keygen -q -p -P "$SSH_KEY_PASSPHRASE" -N "" -f "$KEY" > /dev/null \
-                || { echo "::error::SSH_KEY_PASSPHRASE no abre la llave"; exit 1; }
+            grep -q -- '-----END .*PRIVATE KEY-----' "$ENTRADA" \
+              || error "A SSH_PRIVATE_KEY le falta la ultima linea '-----END ... PRIVATE KEY-----': se corto al copiar."
+            for f in "${frases[@]}"; do
+              cp "$ENTRADA" "$KEY"
+              if msg=$(ssh-keygen -y -P "$f" -f "$KEY" 2>&1 > /dev/null); then
+                [[ -z "$f" ]] || ssh-keygen -q -p -P "$f" -N "" -f "$KEY" > /dev/null
+                abierta=si; break
+              fi
+            done
+            if [[ $abierta != si ]]; then
+              case "$msg" in
+                *"incorrect passphrase"*)
+                  if [[ -z "$limpia" ]]; then
+                    error "Tu llave tiene frase y el secret SSH_KEY_PASSPHRASE esta vacio o no existe."
+                  fi
+                  error "SSH_KEY_PASSPHRASE no es la frase de esta llave. Comprueba la frase en tu compu con: ssh-keygen -y -f ~/.ssh/sshd_conexion" ;;
+                *)
+                  error "SSH_PRIVATE_KEY no se pudo leer como llave privada (${msg##*: }). Vuelve a pegar el archivo completo." ;;
+              esac
             fi
           fi
-          rm -f "$RUNNER_TEMP/llave_entrada" "$RUNNER_TEMP/frase"
-          ssh-keygen -y -P "" -f "$KEY" > "$KEY.pub" \
-            || { echo "::error::SSH_PRIVATE_KEY no es una llave privada valida (o tiene frase y falta SSH_KEY_PASSPHRASE)"; exit 1; }
+          rm -f "$ENTRADA"
+
+          ssh-keygen -y -P "" -f "$KEY" > "$KEY.pub" || error "No pude sacar la llave publica de SSH_PRIVATE_KEY."
           bits=$(ssh-keygen -l -f "$KEY.pub" | awk '{print $1}')
           tipo=$(ssh-keygen -l -f "$KEY.pub" | awk '{print $NF}')
           if [[ "$tipo" != "(RSA)" ]] || (( bits < 4096 )); then
-            echo "::error::La llave es $tipo de $bits bits: debe ser RSA de 4096 bits o mas (ssh-keygen -t rsa -b 4096)."
-            exit 1
+            error "La llave es $tipo de $bits bits: debe ser RSA de 4096 bits o mas (ssh-keygen -t rsa -b 4096)."
           fi
           {
             echo "SSH_KEY_FILE=$KEY"
@@ -166,7 +207,7 @@ jobs:
             echo "KEY_MD5=$(ssh-keygen -l -E md5 -f "$KEY.pub" | awk '{print $2}' | sed 's/^MD5://')"
             echo "KEY_SHA256=$(ssh-keygen -l -f "$KEY.pub" | awk '{print $2}')"
           } >> "$GITHUB_ENV"
-          echo "Llave RSA de $bits bits OK"
+          echo "Llave RSA de $bits bits OK ($(ssh-keygen -l -f "$KEY.pub" | awk '{print $2}'))"
 
       - name: Buscar el droplet por su tag
         id: buscar
