@@ -68,8 +68,12 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
   publickey,keyboard-interactive`, PAM sin common-auth (solo pam_google_authenticator) +
   pam_access, sin Include de sshd_config.d, `RequiredRSASize 4096` (regenera la host key RSA a
   4096 ANTES del template), `semanage port` para ssh_port_t, sshd se reinicia al final.
-  Gotchas probados: con SELinux el secreto TOTP va en `~/.ssh/.google_authenticator`
-  (`secret=${HOME}/...`, ssh_home_t; en `~` sshd no puede reescribirlo); `mlkem768x25519-sha256`
+  Swap de 2 GB (dd) ANTES de cualquier dnf: con 1 GB, dnf + EPEL muere por OOM (rc -9).
+  Secreto OTP en ruta propia de root: `/var/lib/sshd_otp/<usuario>.totp` (0700/0400), PAM con
+  `secret=/var/lib/sshd_otp/${USER}.totp user=root` (con `user=` el dueno debe ser ese usuario).
+  Gotchas probados: con SELinux sshd no puede reescribir el secreto en `~` (crea un temporal y
+  renombra); la carpeta se etiqueta `var_auth_t` con `semanage fcontext` (sshd_t/login_pgm puede
+  crear/renombrar ahi, verificado con sesearch en la politica de Rocky 9); `mlkem768x25519-sha256`
   no lo acepta el sshd de Rocky; re-runs entran como el usuario con el codigo de
   `files/totp.py` via el askpass de Ansible (`ansible_sshpass_prompt: "Verification code:"`).
 

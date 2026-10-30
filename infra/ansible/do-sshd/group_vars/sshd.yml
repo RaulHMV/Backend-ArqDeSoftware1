@@ -8,11 +8,18 @@ totp_secret: "{{ lookup('env', 'TOTP_SECRET') | upper | replace(' ', '') | repla
 
 # Puerto de SSH: sin ningun 2 (nunca el 22). Debe coincidir con el firewall de DigitalOcean.
 ssh_port: "{{ lookup('env', 'SSH_PORT') | default('3947', true) | int }}"
+# Swap (el droplet s-1vcpu-1gb tiene 1 GB de RAM; dnf con EPEL no cabe sin swap).
+swap_mb: 2048
+
 # En Rocky/RHEL el grupo de administradores (sudo) es wheel.
 sudo_group: wheel
-# En ~/.ssh y no en ~/: con SELinux (enforcing en Rocky) sshd solo puede reescribir el
-# archivo dentro de ~/.ssh (tipo ssh_home_t). PAM lo busca ahi con secret=.
-totp_file: "/home/{{ admin_user }}/.ssh/.google_authenticator"
+# Secreto OTP fuera de la ruta por defecto (~/.google_authenticator): carpeta y nombre
+# propios, de root (0700/0400). El usuario entra normal con llave + codigo, pero NO puede
+# leer su propio secreto (solo con sudo). PAM lo abre como root (user=root).
+# SELinux: la carpeta se etiqueta var_auth_t, donde sshd si puede reescribir el archivo.
+otp_dir: /var/lib/sshd_otp
+otp_ext: totp
+otp_file: "{{ otp_dir }}/{{ admin_user }}.{{ otp_ext }}"
 
 # --- Conexion ---
 # root: primera vez (droplet recien creado: DigitalOcean deja entrar a root con la llave

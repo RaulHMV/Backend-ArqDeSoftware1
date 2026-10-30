@@ -7,8 +7,9 @@
 # aqui SOLO se pide el codigo de Google Authenticator.
 #  - Sin "password-auth": por SSH nunca se pide ni se acepta el password de Unix.
 #  - Sin "nullok": quien no tenga su archivo de Google Authenticator NO entra.
-#  - secret= en ~/.ssh: con SELinux, sshd solo puede reescribirlo ahi (ssh_home_t).
-auth       required     pam_google_authenticator.so secret=${HOME}/.ssh/.google_authenticator
+#  - secret=: carpeta y nombre propios (no ~/.google_authenticator); ${USER} = quien entra.
+#  - user=root: el archivo es de root; el usuario no puede leer su propio secreto.
+auth       required     pam_google_authenticator.so secret={{ otp_dir }}/${USER}.{{ otp_ext }} user=root
 
 # ---- ACCOUNT
 account    required     pam_nologin.so

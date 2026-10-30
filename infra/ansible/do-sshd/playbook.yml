@@ -52,6 +52,44 @@
       no_log: true
 
   tasks:
+    # ------------------------------------------------------------ Swap
+    # Con 1 GB de RAM, dnf cargando EPEL se queda sin memoria y el sistema lo mata
+    # (rc -9: paso en el primer deploy). La swap va ANTES de cualquier dnf.
+    - name: Ver si ya hay swap
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swap_actual
+      changed_when: false
+
+    # dd y no fallocate: es lo que documenta RHEL y funciona tambien en XFS.
+    # SELinux: swapon corre como fsadm_t, que puede usar el archivo sin re-etiquetarlo.
+    - name: Crear swap de {{ swap_mb }} MB en /swapfile
+      ansible.builtin.shell: |
+        set -e
+        dd if=/dev/zero of=/swapfile bs=1M count={{ swap_mb }} status=none
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+      when: "'/swapfile' not in swap_actual.stdout"
+
+    - name: Swap permanente (sobrevive reinicios)
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap defaults 0 0"
+
+    # 10 = usar swap solo cuando de verdad falte RAM.
+    - name: Swap solo como respaldo (swappiness 10)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-swap.conf
+        content: "vm.swappiness = 10\n"
+        owner: root
+        group: root
+        mode: "0644"
+      register: swappiness
+
+    - name: Aplicar swappiness
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/90-swap.conf
+      when: swappiness.changed
+
     # ------------------------------------------------------------ Paquetes
     # El modulo PAM de Google Authenticator viene de EPEL.
     # python3-libselinux: Ansible lo necesita para escribir archivos con SELinux activo.
@@ -82,7 +120,7 @@
       register: selinux
       changed_when: false
 
-    # Todo esta pensado para enforcing (puerto etiquetado, secreto TOTP en ~/.ssh).
+    # Todo esta pensado para enforcing (puerto y carpeta OTP etiquetados).
     - name: SELinux en enforcing (ahora y al reiniciar)
       when: selinux.stdout == 'Permissive'
       block:
@@ -172,32 +210,64 @@
         mode: "0600"
         setype: ssh_home_t
 
+    # ---------------------------------------------------------- OTP (Google Authenticator)
+    # Ruta propia en vez de ~/.google_authenticator. Todo de root: el usuario entra normal
+    # (llave + codigo) pero no puede leer su secreto; PAM lo abre como root (user=root).
+    # SELinux: var_auth_t (como /var/lib/google-authenticator en la politica de Rocky), el
+    # tipo donde sshd puede reescribir el archivo en cada login. La regla es permanente.
+    - name: SELinux etiqueta {{ otp_dir }} como var_auth_t (permanente)
+      ansible.builtin.shell: |
+        if semanage fcontext -l -C | grep -q "^{{ otp_dir }}(/\.\*)?\s.*var_auth_t"; then
+          echo sin_cambio
+        else
+          semanage fcontext -a -t var_auth_t "{{ otp_dir }}(/.*)?" 2>/dev/null \
+            || semanage fcontext -m -t var_auth_t "{{ otp_dir }}(/.*)?"
+        fi
+      register: otp_fcontext
+      changed_when: "'sin_cambio' not in otp_fcontext.stdout"
+      when: selinux.stdout != 'Disabled'
+
+    - name: Carpeta de secretos OTP (solo root)
+      ansible.builtin.file:
+        path: "{{ otp_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+        setype: var_auth_t
+
     # El modulo PAM reescribe este archivo en cada login (guarda los codigos usados para
     # DISALLOW_REUSE y RATE_LIMIT): solo se escribe si falta o si cambio el secreto.
-    - name: Leer secreto TOTP actual
+    - name: Leer secreto OTP actual
       ansible.builtin.slurp:
-        src: "{{ totp_file }}"
+        src: "{{ otp_file }}"
       register: ga_actual
       failed_when: false
       no_log: true
 
-    - name: Google Authenticator para {{ admin_user }}
+    - name: Secreto OTP de {{ admin_user }} ({{ otp_file }})
       ansible.builtin.copy:
-        dest: "{{ totp_file }}"
+        dest: "{{ otp_file }}"
         content: |
           {{ totp_secret }}
           " RATE_LIMIT 3 30
           " WINDOW_SIZE 3
           " DISALLOW_REUSE
           " TOTP_AUTH
-        owner: "{{ admin_user }}"
-        group: "{{ admin_user }}"
+        owner: root
+        group: root
         mode: "0400"
-        setype: ssh_home_t
+        setype: var_auth_t
       when: >-
         ga_actual.content is not defined
         or (ga_actual.content | b64decode).splitlines()[0] != totp_secret
       no_log: true
+
+    # Corridas anteriores lo dejaban en ~/.ssh: ya no se usa y no debe quedar a la mano.
+    - name: Quitar el secreto de la ruta vieja
+      ansible.builtin.file:
+        path: "/home/{{ admin_user }}/.ssh/.google_authenticator"
+        state: absent
 
     # root sin password: no puede entrar ni por consola con password.
     # (Si te quedas fuera: panel de DO -> Reset root password -> Recovery Console.)

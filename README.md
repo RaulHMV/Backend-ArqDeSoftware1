@@ -160,6 +160,9 @@ y el firewall (`infra/environments/do-sshd`) y Ansible hace el hardening (`infra
   root no entra y el password de Unix no sirve por SSH (es solo para `sudo`).
 - SSH en el puerto **3947** (configurable, sin ningún `2`: nunca el 22) y el firewall de DigitalOcean solo
   deja llegar **desde tu IP pública**.
+- El secreto de Google Authenticator **no** está en la ruta por defecto (`~/.google_authenticator`):
+  vive en `/var/lib/sshd_otp/<usuario>.totp`, de root. El usuario entra normal pero no puede
+  leer su propio secreto (solo con `sudo`).
 - Banner de acceso restringido, SELinux en enforcing, criptografía moderna, y sshd/PAM sin
   las opciones que no se usan (forwarding, X11, GSSAPI, motd, etc.).
 
