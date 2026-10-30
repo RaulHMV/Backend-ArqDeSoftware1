@@ -3,7 +3,8 @@ name: sshd-deploy
 # Crea (o vuelve a endurecer) el droplet SSHD-Conexion en DigitalOcean con Rocky Linux 9
 # y le hace hardening de SSH + PAM con Google Authenticator:
 #   - Terraform: droplet, llave SSH y firewall (SOLO tu IP y SOLO el puerto de SSH).
-#   - Ansible: usuario con llave RSA 4096 + codigo TOTP, sudo con password, banner,
+#   - Ansible: usuario de minimo privilegio con llave RSA 4096 + codigo TOTP (root solo
+#     con su - y su password), banner,
 #     sshd y PAM sin lo que no se usa, puerto sin ningun 2 (nunca el 22), SELinux.
 #
 # SIN state remoto (gratis): el droplet se busca por su tag SSHD_Conexion.
@@ -16,7 +17,8 @@ name: sshd-deploy
 #   - DIGITALOCEAN_TOKEN: token de API de DigitalOcean (permiso de escritura).
 #   - SSH_PRIVATE_KEY:    tu llave PRIVADA RSA 4096 completa (ssh-keygen o .ppk de PuTTYgen).
 #   - SSH_KEY_PASSPHRASE: (opcional) la frase de esa llave, si le pusiste.
-#   - SUDO_PASSWORD:      password de sudo de tu usuario (12+ caracteres).
+#   - ROOT_PASSWORD:      password de root, el que pide su - (12+ caracteres).
+#                         (Si no existe se usa SUDO_PASSWORD, el nombre anterior.)
 #   - TOTP_SECRET:        secreto base32 de Google Authenticator (ver README).
 
 on:
@@ -97,7 +99,7 @@ jobs:
       - name: Validar parametros y secrets
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD || secrets.SUDO_PASSWORD }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
         run: |
           err=0
@@ -109,7 +111,7 @@ jobs:
           fi
           [[ -n "$DIGITALOCEAN_TOKEN" ]] || fail "Falta el secret DIGITALOCEAN_TOKEN"
           [[ -n "$SSH_PRIVATE_KEY" ]] || fail "Falta el secret SSH_PRIVATE_KEY"
-          (( ${#SUDO_PASSWORD} >= 12 )) || fail "El secret SUDO_PASSWORD debe existir y tener 12+ caracteres"
+          (( ${#ROOT_PASSWORD} >= 12 )) || fail "El secret ROOT_PASSWORD (o SUDO_PASSWORD) debe existir y tener 12+ caracteres"
           totp=$(tr -d ' =' <<< "${TOTP_SECRET^^}")
           [[ "$totp" =~ ^[A-Z2-7]{16,}$ ]] || fail "El secret TOTP_SECRET debe ser base32 (A-Z y 2-7), 16+ caracteres"
           exit $err
@@ -351,7 +353,7 @@ jobs:
           python-version: "3.12"
 
       # Version FIJA (la probada). El runner trae su propio Ansible que cambia solo: no se usa.
-      # passlib: para password_hash (el hash del password de sudo).
+      # passlib: para password_hash (el hash del password de root).
       - name: Instalar Ansible
         if: ${{ inputs.action == 'apply' }}
         run: |
@@ -363,7 +365,7 @@ jobs:
         if: ${{ inputs.action == 'apply' }}
         working-directory: ${{ env.ANSIBLE_DIR }}
         env:
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD || secrets.SUDO_PASSWORD }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
         run: ansible-playbook playbook.yml
 
@@ -372,7 +374,7 @@ jobs:
         if: ${{ inputs.action == 'apply' }}
         working-directory: ${{ env.ANSIBLE_DIR }}
         env:
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD || secrets.SUDO_PASSWORD }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
         run: |
           set -uo pipefail
@@ -404,15 +406,37 @@ jobs:
           # carpeta de control) que Ansible reusa. Sin reuso abriria varias conexiones y
           # DISALLOW_REUSE rechazaria el mismo codigo en la segunda (paso en el run real).
           # Codigo de una ventana de 30 s nueva: el del playbook ya no sirve.
+          # Las dos llamadas usan la MISMA conexion maestra (un solo codigo).
           sleep $(( 31 - $(date +%s) % 30 ))
-          salida=$(CONNECT_AS=admin SSH_CONNECT_PORT="$SSH_PORT" \
-                   ANSIBLE_SSH_ARGS="-o ControlMaster=auto -o ControlPersist=30s" \
-                   ANSIBLE_SSH_CONTROL_PATH_DIR="$(mktemp -d)" \
-                   ansible sshd --playbook-dir . -b -m ansible.builtin.command -a "id -un" 2>&1)
-          if grep -q '^root$' <<< "$salida"; then
-            bien "llave + codigo TOTP entra, y sudo funciona con el password"
+          CP_DIR=$(mktemp -d)
+          adhoc() {
+            CONNECT_AS=admin SSH_CONNECT_PORT="$SSH_PORT" \
+            ANSIBLE_SSH_ARGS="-o ControlMaster=auto -o ControlPersist=60s" \
+            ANSIBLE_SSH_CONTROL_PATH_DIR="$CP_DIR" \
+            ansible sshd --playbook-dir . "$@" 2>&1
+          }
+
+          # Como el usuario, SIN root: solo su grupo y sin sudo.
+          salida=$(adhoc -m ansible.builtin.shell \
+            -a 'echo "GRUPOS=$(id -Gn)"; if sudo -n true 2> /dev/null; then echo SUDO=si; else echo SUDO=no; fi')
+          if grep -q '^GRUPOS=' <<< "$salida"; then
+            bien "llave + codigo TOTP entra"
+            if grep -qx "GRUPOS=$ADMIN_USER" <<< "$salida" && grep -qx "SUDO=no" <<< "$salida"; then
+              bien "minimo privilegio: $ADMIN_USER solo esta en su grupo y no tiene sudo"
+            else
+              mal "$ADMIN_USER tiene privilegios de mas: $(grep -E '^(GRUPOS|SUDO)=' <<< "$salida" | tr '\n' ' ')"
+            fi
           else
-            mal "no se pudo entrar con llave + codigo TOTP o sudo fallo"
+            mal "no se pudo entrar con llave + codigo TOTP"
+            echo "$salida"
+          fi
+
+          # Hacerse root: su - con el password de root (become su de Ansible).
+          salida=$(adhoc -b -m ansible.builtin.command -a "id -un")
+          if grep -qx 'root' <<< "$salida"; then
+            bien "su - root funciona con el password de root"
+          else
+            mal "su - root fallo"
             echo "$salida"
           fi
           (( ok == 1 ))
@@ -441,7 +465,7 @@ jobs:
             echo "|---|---|"
             echo "| IP | \`$DROPLET_IP\` |"
             echo "| Puerto SSH | \`$SSH_PORT\` (el 22 esta cerrado) |"
-            echo "| Usuario | \`$ADMIN_USER\` (sudo con tu SUDO_PASSWORD) |"
+            echo "| Usuario | \`$ADMIN_USER\` (minimo privilegio: sin sudo; para root usa \`su -\`) |"
             echo "| Solo entra desde | \`$MI_IP\` |"
             echo "| Tu llave | RSA \`$KEY_SHA256\` |"
             echo "| Huella del servidor | RSA \`$HOST_FP\` |"

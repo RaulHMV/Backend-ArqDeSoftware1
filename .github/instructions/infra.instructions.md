@@ -63,8 +63,13 @@ description: "Contexto de la infraestructura Terraform (módulos, stack, env pro
 - `environments/do-sshd/` + `ansible/do-sshd/`: DigitalOcean (provider digitalocean, token por env
   `DIGITALOCEAN_TOKEN`), SIN backend remoto: el workflow busca el droplet por tag `SSHD_Conexion`
   (nombre `SSHD-Conexion`: DO no acepta `_` en nombres). Rocky Linux 9 (`rockylinux-9-x64`),
-  firewall de DO solo `my_ip` en `ssh_port` (default 3947; NINGUN digito 2, regla del profe). Playbook: usuario en `wheel`
-  con llave RSA 4096 exclusiva + Google Authenticator (EPEL), `AuthenticationMethods
+  firewall de DO solo `my_ip` en `ssh_port` (default 3947; NINGUN digito 2, regla del profe). Playbook: usuario de MINIMO
+  PRIVILEGIO (solo su grupo, sin sudo, password "!"); root solo con `su -` + `ROOT_PASSWORD`, y
+  `pam_wheel.so use_uid group=<usuario>` en /etc/pam.d/su (cuenta el grupo primario, probado);
+  Ansible re-entra como el usuario con `become_method: su`. Llave RSA 4096 exclusiva en
+  `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` (root, 0644: sshd la lee como el usuario;
+  etc_t) + Google Authenticator (EPEL), `LoginGraceTime 60` (con 30 + PerSourcePenalties de
+  OpenSSH 9.9 el humano quedaba bloqueado), `AuthenticationMethods
   publickey,keyboard-interactive`, PAM sin common-auth (solo pam_google_authenticator) +
   pam_access, sin Include de sshd_config.d, `RequiredRSASize 4096` (regenera la host key RSA a
   4096 ANTES del template), `semanage port` para ssh_port_t, sshd se reinicia al final.

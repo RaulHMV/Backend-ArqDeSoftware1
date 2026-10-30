@@ -35,7 +35,8 @@ KbdInteractiveAuthentication yes
 # por ahi llega el codigo TOTP. En "no" nadie podria entrar.
 ChallengeResponseAuthentication yes
 UsePAM yes
-AuthorizedKeysFile .ssh/authorized_keys
+# La llave vive en una carpeta de root, no en el home: el usuario no puede agregar otras.
+AuthorizedKeysFile {{ keys_dir }}/%u
 StrictModes yes
 
 # Sin password de Unix por SSH (el password de {{ admin_user }} es solo para sudo).
@@ -50,7 +51,8 @@ KerberosAuthentication no
 
 # Limites contra fuerza bruta y conexiones colgadas.
 MaxAuthTries 3
-LoginGraceTime 30
+# 60 s para entrar (ver la huella + escribir el codigo TOTP); con 30 no alcanzaba.
+LoginGraceTime 60
 MaxStartups 10:30:60
 MaxSessions 4
 ClientAliveInterval 300

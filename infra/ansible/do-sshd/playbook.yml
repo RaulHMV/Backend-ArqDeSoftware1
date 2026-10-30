@@ -6,14 +6,18 @@
 #    Authenticator. root no entra; el password de Unix no sirve para entrar por SSH.
 #  - SSH en el puerto {{ ssh_port }} (el 22 queda cerrado). El firewall de DigitalOcean
 #    (Terraform) solo deja llegar a ese puerto desde tu IP.
-#  - El password de {{ admin_user }} (secret SUDO_PASSWORD) es para sudo (grupo wheel).
+#  - {{ admin_user }} es de MINIMO PRIVILEGIO: solo en su propio grupo, sin sudo y sin
+#    password propio. Para ser root: su - con el password de root (secret ROOT_PASSWORD);
+#    y solo {{ admin_user }} puede usar su.
+#  - La llave autorizada y el secreto OTP viven fuera de su home, en carpetas de root.
 #  - Banner de acceso restringido antes de autenticarse.
 #  - sshd y PAM sin las opciones que no se usan.
 #
-# Requiere en el entorno: ADMIN_USER, SUDO_PASSWORD, TOTP_SECRET, SSH_KEY_FILE,
+# Requiere en el entorno: ADMIN_USER, ROOT_PASSWORD, TOTP_SECRET, SSH_KEY_FILE,
 # SSH_PUBLIC_KEY_FILE, SSH_PORT, DROPLET_IP, CONNECT_AS (root|admin) y
 # SSH_CONNECT_PORT. Lo arma el workflow.
-# Idempotente: se puede volver a correr ya endurecido (entra con llave + codigo).
+# Idempotente: se puede volver a correr ya endurecido (entra con llave + codigo y se
+# hace root con su -).
 #
 # ORDEN IMPORTANTE: sshd se reinicia al FINAL (handler). Antes de eso ya deben estar
 # SELinux y firewalld con el puerto nuevo y la llave del servidor en 4096: si sshd no
@@ -41,12 +45,12 @@
         that:
           - admin_user is match('^[a-z_][a-z0-9_-]{0,31}$')
           - admin_user != 'root'
-          - admin_password | length >= 12
+          - root_password | length >= 12
           - totp_secret is match('^[A-Z2-7]{16,}$')
           - admin_pubkey is match('^ssh-rsa ')
           - "'2' not in (ssh_port | string) and 1024 <= ssh_port | int <= 65535"
         fail_msg: >-
-          Revisa: usuario en minusculas (no root), SUDO_PASSWORD de 12+ caracteres,
+          Revisa: usuario en minusculas (no root), ROOT_PASSWORD de 12+ caracteres,
           TOTP_SECRET en base32 (A-Z y 2-7, 16+ caracteres), llave RSA y puerto
           entre 1024 y 65535 sin ningun 2.
       no_log: true
@@ -179,36 +183,56 @@
       changed_when: fw.stdout == 'si'
       when: firewalld.stdout == 'active'
 
-    # ------------------------------------------------------------ Usuario
-    # Salt fijo (derivado del usuario): mismo hash en cada corrida, sin "changed" falso.
-    - name: Usuario {{ admin_user }} (sudo con password)
+    # ------------------------------------------------------------ Usuario y root
+    # MINIMO PRIVILEGIO: solo su propio grupo (groups "" lo saca de wheel = sin sudo) y
+    # sin password propio ("!"): entra con llave + codigo y no lo necesita para nada mas.
+    - name: Usuario {{ admin_user }} de minimo privilegio (solo su grupo, sin sudo)
       ansible.builtin.user:
         name: "{{ admin_user }}"
         shell: /bin/bash
-        groups: "{{ sudo_group }}"
-        append: true
-        password: "{{ admin_password | password_hash('sha512', (admin_user ~ '-sshd') | hash('sha256') | truncate(16, true, '', 0)) }}"
+        groups: ""
+        append: false
+        password: "!"
+        update_password: always
+
+    # su - pide ESTE password (secret ROOT_PASSWORD). root sigue sin entrar por SSH.
+    # Salt fijo: mismo hash en cada corrida, sin "changed" falso.
+    - name: Password de root (para su -)
+      ansible.builtin.user:
+        name: root
+        password: "{{ root_password | password_hash('sha512', 'root-sshd' | hash('sha256') | truncate(16, true, '', 0)) }}"
         update_password: always
       no_log: true
 
-    - name: Carpeta .ssh
+    # Solo {{ admin_user }} puede usar su: pam_wheel con SU grupo (no wheel). pam_wheel
+    # cuenta el grupo primario, asi el usuario sigue solo en su grupo. root no se afecta
+    # (pam_rootok va antes).
+    - name: Solo {{ admin_user }} puede usar su
+      ansible.builtin.lineinfile:
+        path: /etc/pam.d/su
+        regexp: '^#?\s*auth\s+required\s+pam_wheel\.so'
+        line: "auth\t\trequired\tpam_wheel.so use_uid group={{ admin_user }}"
+        insertafter: '^auth\s+sufficient\s+pam_rootok\.so'
+
+    # La llave NO va en ~/.ssh/authorized_keys (ahi el usuario podria agregar otras):
+    # va en {{ keys_dir }}/<usuario>, de root. sshd la lee COMO el usuario, por eso 0644
+    # (puede leerla, no cambiarla). SELinux: etc_t, que sshd puede leer.
+    - name: Carpeta de llaves autorizadas (de root)
       ansible.builtin.file:
-        path: "/home/{{ admin_user }}/.ssh"
+        path: "{{ keys_dir }}"
         state: directory
-        owner: "{{ admin_user }}"
-        group: "{{ admin_user }}"
-        mode: "0700"
-        setype: ssh_home_t
+        owner: root
+        group: root
+        mode: "0755"
 
     # Exclusivo: solo tu llave RSA 4096, cualquier otra se borra.
-    - name: Solo tu llave publica puede entrar
+    - name: Solo tu llave publica puede entrar ({{ keys_dir }}/{{ admin_user }})
       ansible.builtin.copy:
-        dest: "/home/{{ admin_user }}/.ssh/authorized_keys"
+        dest: "{{ keys_dir }}/{{ admin_user }}"
         content: "{{ admin_pubkey | trim }}\n"
-        owner: "{{ admin_user }}"
-        group: "{{ admin_user }}"
-        mode: "0600"
-        setype: ssh_home_t
+        owner: root
+        group: root
+        mode: "0644"
 
     # ---------------------------------------------------------- OTP (Google Authenticator)
     # Ruta propia en vez de ~/.google_authenticator. Todo de root: el usuario entra normal
@@ -263,20 +287,9 @@
         or (ga_actual.content | b64decode).splitlines()[0] != totp_secret
       no_log: true
 
-    # Corridas anteriores lo dejaban en ~/.ssh: ya no se usa y no debe quedar a la mano.
-    - name: Quitar el secreto de la ruta vieja
-      ansible.builtin.file:
-        path: "/home/{{ admin_user }}/.ssh/.google_authenticator"
-        state: absent
-
-    # root sin password: no puede entrar ni por consola con password.
-    # (Si te quedas fuera: panel de DO -> Reset root password -> Recovery Console.)
-    - name: Bloquear el password de root
-      ansible.builtin.user:
-        name: root
-        password_lock: true
-
     # ------------------------------------------------------------ sudo
+    # Nadie tiene sudo ({{ admin_user }} no esta en wheel); si algun dia se da, ya queda
+    # con bitacora y limites.
     - name: Endurecer sudo
       ansible.builtin.copy:
         dest: /etc/sudoers.d/90-hardening
@@ -365,6 +378,19 @@
         backup: true
         validate: /usr/sbin/sshd -t -f %s
       notify: Reiniciar sshd
+
+    # sshd ya usa la config nueva (llave en {{ keys_dir }}). La sesion de Ansible sigue
+    # abierta; recien ahora se quitan las rutas viejas (antes, un reconect fallaria).
+    - name: Aplicar la config de sshd ahora
+      ansible.builtin.meta: flush_handlers
+
+    - name: Quitar la llave y el secreto OTP de las rutas viejas (home del usuario)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/home/{{ admin_user }}/.ssh/authorized_keys"
+        - "/home/{{ admin_user }}/.ssh/.google_authenticator"
 
   handlers:
     - name: Reiniciar sshd

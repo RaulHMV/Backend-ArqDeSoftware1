@@ -157,12 +157,17 @@ Un droplet **Rocky Linux 9** en DigitalOcean con SSH + PAM endurecidos. Terrafor
 y el firewall (`infra/environments/do-sshd`) y Ansible hace el hardening (`infra/ansible/do-sshd`):
 
 - Solo entra **tu usuario**, con **tu llave RSA 4096 y el código de Google Authenticator**.
-  root no entra y el password de Unix no sirve por SSH (es solo para `sudo`).
+  root no entra por SSH.
+- El usuario es de **mínimo privilegio**: solo está en su propio grupo, sin `sudo` y sin
+  password propio. Para ser root: `su -` con el **password de root**, y solo ese usuario
+  puede usar `su`.
+- Tu llave autorizada no está en `~/.ssh/authorized_keys`: vive en
+  `/etc/ssh/authorized_keys/<usuario>`, de root (el usuario no puede agregar otras).
 - SSH en el puerto **3947** (configurable, sin ningún `2`: nunca el 22) y el firewall de DigitalOcean solo
   deja llegar **desde tu IP pública**.
 - El secreto de Google Authenticator **no** está en la ruta por defecto (`~/.google_authenticator`):
   vive en `/var/lib/sshd_otp/<usuario>.totp`, de root. El usuario entra normal pero no puede
-  leer su propio secreto (solo con `sudo`).
+  leer su propio secreto (solo como root).
 - Banner de acceso restringido, SELinux en enforcing, criptografía moderna, y sshd/PAM sin
   las opciones que no se usan (forwarding, X11, GSSAPI, motd, etc.).
 
@@ -170,11 +175,12 @@ y el firewall (`infra/environments/do-sshd`) y Ansible hace el hardening (`infra
 > tag `SSHD_Conexion`.
 
 1. Crea los secrets del repo: `DIGITALOCEAN_TOKEN`, `SSH_PRIVATE_KEY` (tu llave privada RSA 4096
-   completa), `SSH_KEY_PASSPHRASE` (si tu llave tiene frase), `SUDO_PASSWORD` (12+ caracteres) y
+   completa), `SSH_KEY_PASSPHRASE` (si tu llave tiene frase), `ROOT_PASSWORD` (el de `su -`, 12+ caracteres) y
    `TOTP_SECRET` (secreto base32 que también registras en Google Authenticator).
 2. Actions → **sshd-deploy** → `plan`, luego `apply` + `deploy` en confirm, con tu IP en
    `mi_ip` (la ves en https://ifconfig.me). El job prueba al final que root no entra, que la
-   llave sola no basta, que el 22 está cerrado y que llave + código + sudo sí funcionan.
+   llave sola no basta, que el 22 está cerrado, que el usuario no tiene sudo ni otros grupos,
+   y que llave + código entra y `su -` con el password de root funciona.
 3. Conéctate con lo que diga el resumen del run, p. ej.
    `ssh -i ~/.ssh/sshd_conexion -p 3947 operador@<IP>` (te pide el código de 6 dígitos).
 4. **sshd-destroy** al terminar (el droplet se cobra por hora).

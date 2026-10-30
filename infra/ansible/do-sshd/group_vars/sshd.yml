@@ -1,7 +1,8 @@
 ---
 # Todo llega por variables de entorno desde el workflow (secrets e inputs).
 admin_user: "{{ lookup('env', 'ADMIN_USER') }}"
-admin_password: "{{ lookup('env', 'SUDO_PASSWORD') }}"
+# Password de ROOT: el que pide su -. El usuario no tiene password propio ni sudo.
+root_password: "{{ lookup('env', 'ROOT_PASSWORD') }}"
 admin_pubkey: "{{ lookup('file', lookup('env', 'SSH_PUBLIC_KEY_FILE')) }}"
 # Se acepta como lo muestra Google Authenticator / KeePass (con espacios o minusculas).
 totp_secret: "{{ lookup('env', 'TOTP_SECRET') | upper | replace(' ', '') | replace('=', '') }}"
@@ -11,8 +12,9 @@ ssh_port: "{{ lookup('env', 'SSH_PORT') | default('3947', true) | int }}"
 # Swap (el droplet s-1vcpu-1gb tiene 1 GB de RAM; dnf con EPEL no cabe sin swap).
 swap_mb: 2048
 
-# En Rocky/RHEL el grupo de administradores (sudo) es wheel.
-sudo_group: wheel
+# Llaves autorizadas fuera del home: /etc/ssh/authorized_keys/<usuario>, de root
+# (AuthorizedKeysFile en sshd_config). El usuario no puede agregar llaves.
+keys_dir: /etc/ssh/authorized_keys
 # Secreto OTP fuera de la ruta por defecto (~/.google_authenticator): carpeta y nombre
 # propios, de root (0700/0400). El usuario entra normal con llave + codigo, pero NO puede
 # leer su propio secreto (solo con sudo). PAM lo abre como root (user=root).
@@ -35,7 +37,10 @@ ansible_sshpass_prompt: "Verification code:"
 # Sin known_hosts en el runner: la llave del servidor cambia (se regenera a RSA 4096) y con
 # una huella vieja guardada OpenSSH desactiva keyboard-interactive (el codigo TOTP).
 ansible_ssh_common_args: "-o UserKnownHostsFile=/dev/null"
-ansible_become_password: "{{ admin_password }}"
+# Primera vez (root): sudo de root a root. Despues ({{ admin_user }}): su - con el
+# password de root, igual que lo haria una persona (el usuario no tiene sudo).
+ansible_become_method: "{{ 'sudo' if connect_as == 'root' else 'su' }}"
+ansible_become_password: "{{ root_password }}"
 # Python del sistema en Rocky 9 (3.9). Fijo: sin descubrirlo, que cuesta una conexion
 # mas (y con TOTP, cada conexion nueva necesita su propio codigo).
 ansible_python_interpreter: /usr/bin/python3
